@@ -1,0 +1,6 @@
+PyMuPDF>=1.27.0
+google-api-python-client>=2.140.0
+google-auth>=2.30.0
+google-auth-oauthlib>=1.2.0
+requests>=2.25.0
+schedule>=1.2.0
