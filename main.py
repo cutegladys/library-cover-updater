@@ -78,6 +78,11 @@ def job_cover_web():
     _run_task("cover_web", cover_web.run)
 
 
+def job_auto_fill_links():
+    from tasks import auto_fill_links
+    _run_task("auto_fill_links", auto_fill_links.run)
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -92,10 +97,15 @@ def register_schedules():
         os.environ.get("COVER_WEB_AT_UTC", "18:00")
     ).do(job_cover_web)
 
+    # auto_fill_links：每日 22:00 UTC = 每日 06:00 TW（Phase 4-3）
+    schedule.every().day.at(
+        os.environ.get("AUTO_FILL_LINKS_AT_UTC", "22:00")
+    ).do(job_auto_fill_links)
+
     # TODO Phase 2: duplicate_detector 週二 18:00 UTC = 週三 02:00 TW
     # TODO Phase 2: merge_queue_poller 每 5 分鐘 poll _MergeQueue
     # TODO Phase 3: folder_sync 每日 04:00 UTC = 12:00 TW
-    # TODO Phase 4: picture_books / inbox_processor / auto_fill_links / health_dashboard
+    # TODO Phase 4: picture_books / inbox_processor / health_dashboard
 
 
 def main():
@@ -108,6 +118,7 @@ def main():
         logger.info("RUN_ON_START=true，立即跑一次所有 task")
         job_cover_drive()
         job_cover_web()
+        job_auto_fill_links()
         # 未來其他 task 加上去
 
     while True:
