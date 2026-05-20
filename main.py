@@ -93,6 +93,11 @@ def job_health_dashboard():
     _run_task("health_dashboard", health_dashboard.run)
 
 
+def job_inbox_processor():
+    from tasks import inbox_processor
+    _run_task("inbox_processor", inbox_processor.run)
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -122,9 +127,14 @@ def register_schedules():
         os.environ.get("HEALTH_DASHBOARD_AT_UTC", "15:00")
     ).do(job_health_dashboard)
 
+    # inbox_processor：每日 01:00 UTC = 每日 09:00 TW（Phase 4-2，原 GAS 時間）
+    schedule.every().day.at(
+        os.environ.get("INBOX_PROCESSOR_AT_UTC", "01:00")
+    ).do(job_inbox_processor)
+
     # TODO Phase 2: duplicate_detector 週二 18:00 UTC = 週三 02:00 TW
     # TODO Phase 2: merge_queue_poller 每 5 分鐘 poll _MergeQueue
-    # TODO Phase 4: picture_books / inbox_processor
+    # TODO Phase 4: picture_books
 
 
 def main():
@@ -140,6 +150,7 @@ def main():
         job_auto_fill_links()
         job_folder_sync()
         job_health_dashboard()
+        job_inbox_processor()
         # 未來其他 task 加上去
 
     while True:
