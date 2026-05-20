@@ -88,6 +88,11 @@ def job_folder_sync():
     _run_task("folder_sync", folder_sync.run)
 
 
+def job_health_dashboard():
+    from tasks import health_dashboard
+    _run_task("health_dashboard", health_dashboard.run)
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -112,9 +117,14 @@ def register_schedules():
         os.environ.get("FOLDER_SYNC_AT_UTC", "04:00")
     ).do(job_folder_sync)
 
+    # health_dashboard：每日 15:00 UTC = 每日 23:00 TW（Phase 4-4）
+    schedule.every().day.at(
+        os.environ.get("HEALTH_DASHBOARD_AT_UTC", "15:00")
+    ).do(job_health_dashboard)
+
     # TODO Phase 2: duplicate_detector 週二 18:00 UTC = 週三 02:00 TW
     # TODO Phase 2: merge_queue_poller 每 5 分鐘 poll _MergeQueue
-    # TODO Phase 4: picture_books / inbox_processor / health_dashboard
+    # TODO Phase 4: picture_books / inbox_processor
 
 
 def main():
@@ -129,6 +139,7 @@ def main():
         job_cover_web()
         job_auto_fill_links()
         job_folder_sync()
+        job_health_dashboard()
         # 未來其他 task 加上去
 
     while True:
