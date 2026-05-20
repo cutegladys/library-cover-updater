@@ -247,26 +247,58 @@ def run():
     if s2t_changed > 0:
         logger.info(f"[picture_books] 🔁 簡→繁：{s2t_changed}/{len(orphans)} 筆 title 有變動")
 
-    if dry_run:
-        logger.info(f"[picture_books] (dry_run) 將寫 {len(rows)} 列到 {DRAFT_SHEET}")
-        return {"task": "picture_books", "targets": len(orphans), "stats": {"orphans": len(orphans), "s2t_changed": s2t_changed, "dry_run": True}}
-
-    # clear + write
+    # ⚠️ 改 append-by-fileid（對齊 _Screenshot_Draft / 原 _pbWriteDraft 行為）
+    # 讀既有 _PB_Draft，找 F 欄 (FileId) set，跳過已存在的 fileId
+    existing_fids = set()
     try:
-        sheets_service.spreadsheets().values().clear(
-            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!A:J",
+        existing_res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!F2:F",
+            valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
-    except HttpError:
-        pass
+        for r in existing_res.get("values", []):
+            if r and r[0]:
+                existing_fids.add(str(r[0]).strip())
+    except HttpError as e:
+        if e.resp.status == 400:
+            # 分頁剛建、A2:F 空、視為無既有 fid
+            pass
+        else:
+            raise
 
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=sid,
-        range=f"'{DRAFT_SHEET}'!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": rows},
-    ).execute()
+    logger.info(f"[picture_books] _PB_Draft 既有 FileId: {len(existing_fids)}")
 
-    stats = {"orphans": len(orphans), "rows_written": len(rows), "s2t_changed": s2t_changed}
+    # 過濾：rows[0] 是 header（如分頁空、要寫一次 header）；之後 rows 每列 F 是 FileId
+    has_header = len(existing_fids) > 0 or rows[0][0] == "書名(草稿)"
+    # 重新組要 append 的 rows：跳過 fileId 已在 existing_fids 的
+    new_rows = []
+    if not has_header:
+        # 分頁空、先寫 header
+        new_rows.append(rows[0])
+    for r in rows[1:]:
+        fid = r[5] if len(r) > 5 else ""
+        if str(fid).strip() in existing_fids:
+            continue
+        new_rows.append(r)
+
+    appended = len(new_rows) - (1 if not has_header else 0)
+    skipped = len(orphans) - appended
+    logger.info(f"[picture_books] 本次 append {appended} 列、跳過 {skipped} 既有 fileId")
+
+    if dry_run:
+        logger.info(f"[picture_books] (dry_run) 將 append {len(new_rows)} 列到 {DRAFT_SHEET}")
+        return {"task": "picture_books", "targets": len(orphans), "stats": {"orphans": len(orphans), "appended": appended, "skipped": skipped, "s2t_changed": s2t_changed, "dry_run": True}}
+
+    if new_rows:
+        # 用 append 而非 update（保留既有 + user PENDING/APPROVED 標記）
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=sid,
+            range=f"'{DRAFT_SHEET}'!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": new_rows},
+        ).execute()
+
+    stats = {"orphans": len(orphans), "appended": appended, "skipped_existing": skipped, "s2t_changed": s2t_changed}
     logger.info(f"[picture_books] 完成 stats={stats}")
     return {
         "task": "picture_books",

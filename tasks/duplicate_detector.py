@@ -197,19 +197,45 @@ def run():
             "人工 review、決定 master row",
         ])
 
-    if not dry_run:
-        # clear + write
-        try:
-            sheets_service.spreadsheets().values().clear(
-                spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!A:F",
-            ).execute()
-        except HttpError:
-            pass
-        sheets_service.spreadsheets().values().update(
+    # ⚠️ 改 append-by-group-key（對齊 _Screenshot_Draft / _PB_Draft 行為，避免覆蓋 user review 標記）
+    # group key = title (lowered) + author (lowered)，已存在的 group 跳過
+    existing_keys = set()
+    try:
+        existing_res = sheets_service.spreadsheets().values().get(
+            spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!C2:D",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        for r in existing_res.get("values", []):
+            if r and len(r) >= 1:
+                title = str(r[0]).strip().lower()
+                author = (str(r[1]) if len(r) > 1 else "").strip().lower()
+                if title:
+                    existing_keys.add((title, author))
+    except HttpError as e:
+        if e.resp.status != 400:
+            raise
+
+    logger.info(f"[duplicate_detector] _DupCandidates 既有 group: {len(existing_keys)}")
+
+    has_header = len(existing_keys) > 0
+    new_rows = [] if has_header else [rows[0]]
+    for r in rows[1:]:
+        title = str(r[2]).strip().lower() if len(r) > 2 else ""
+        author = str(r[3]).strip().lower() if len(r) > 3 else ""
+        if (title, author) in existing_keys:
+            continue
+        new_rows.append(r)
+
+    skipped_existing = (len(rows) - 1) - (len(new_rows) - (0 if has_header else 1))
+    logger.info(f"[duplicate_detector] 本次 append {len(new_rows) - (0 if has_header else 1)} 新 group、跳過 {skipped_existing} 既有")
+
+    if not dry_run and new_rows:
+        sheets_service.spreadsheets().values().append(
             spreadsheetId=sid,
             range=f"'{CANDIDATES_SHEET}'!A1",
             valueInputOption="USER_ENTERED",
-            body={"values": rows},
+            insertDataOption="INSERT_ROWS",
+            body={"values": new_rows},
         ).execute()
 
     # 通知含 inline button（D2 Telegram bridge）
