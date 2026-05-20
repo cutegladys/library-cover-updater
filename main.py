@@ -103,6 +103,16 @@ def job_picture_books():
     _run_task("picture_books", picture_books.run)
 
 
+def job_duplicate_detector():
+    from tasks import duplicate_detector
+    _run_task("duplicate_detector", duplicate_detector.run)
+
+
+def job_duplicate_merger():
+    from tasks import duplicate_merger
+    _run_task("duplicate_merger", duplicate_merger.run)
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -142,8 +152,13 @@ def register_schedules():
         os.environ.get("PICTURE_BOOKS_AT_UTC", "18:00")
     ).do(job_picture_books)
 
-    # TODO Phase 2: duplicate_detector 週二 18:00 UTC = 週三 02:00 TW
-    # TODO Phase 2: merge_queue_poller 每 5 分鐘 poll _MergeQueue
+    # duplicate_detector：週二 18:00 UTC = 週三 02:00 TW（Phase 2）
+    schedule.every().tuesday.at(
+        os.environ.get("DUPLICATE_DETECTOR_AT_UTC", "18:00")
+    ).do(job_duplicate_detector)
+
+    # duplicate_merger：不自動排程；要 LIVE_MERGE=true + RUN_ON_START=true Redeploy 手動觸發
+    # （未來 D2 Telegram bridge 上線後改 Telegram inline button 觸發 → 寫 sheet 旗標 → poll）
 
 
 def main():
@@ -161,7 +176,11 @@ def main():
         job_health_dashboard()
         job_inbox_processor()
         job_picture_books()
-        # 未來其他 task 加上去
+        job_duplicate_detector()
+        # duplicate_merger 受 LIVE_MERGE env 控制、不放在這
+        if os.environ.get("LIVE_MERGE", "").lower() in ("1", "true", "yes"):
+            logger.info("LIVE_MERGE=true，跑 duplicate_merger 一次")
+            job_duplicate_merger()
 
     while True:
         schedule.run_pending()
