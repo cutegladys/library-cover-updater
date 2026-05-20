@@ -73,6 +73,11 @@ def job_cover_drive():
     _run_task("cover_drive", cover_drive.run)
 
 
+def job_cover_web():
+    from tasks import cover_web
+    _run_task("cover_web", cover_web.run)
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -82,7 +87,11 @@ def register_schedules():
         os.environ.get("COVER_DRIVE_AT_UTC", "18:00")
     ).do(job_cover_drive)
 
-    # TODO Phase 1: cover_web 週日 18:00 UTC = 週一 02:00 TW
+    # cover_web：週日 18:00 UTC = 週一 02:00 TW（Phase 1）
+    schedule.every().sunday.at(
+        os.environ.get("COVER_WEB_AT_UTC", "18:00")
+    ).do(job_cover_web)
+
     # TODO Phase 2: duplicate_detector 週二 18:00 UTC = 週三 02:00 TW
     # TODO Phase 2: merge_queue_poller 每 5 分鐘 poll _MergeQueue
     # TODO Phase 3: folder_sync 每日 04:00 UTC = 12:00 TW
@@ -98,6 +107,7 @@ def main():
     if os.environ.get("RUN_ON_START", "false").lower() in ("1", "true", "yes"):
         logger.info("RUN_ON_START=true，立即跑一次所有 task")
         job_cover_drive()
+        job_cover_web()
         # 未來其他 task 加上去
 
     while True:
