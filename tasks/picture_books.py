@@ -1,33 +1,36 @@
 """
-英文繪本資源 Inbox 處理器 — 簡化版（Phase 4-1）
+英文繪本資源 Inbox 處理器 — 完整版（Phase 4-1）
 
-對應 pictureBooksProcessor.js (553 行) + driveIndex.js rebuildDriveIndex / linkDriveFilesFromNote。
-
-GAS 原版因 6 分鐘 timeout、用 sentinel + 自我排程分段續跑、很複雜。
-Python 容器無 6 分鐘限制 → recursive list 一次跑完，不必 sentinel/queue。
+對應 pictureBooksProcessor.js _pbFindOrphans + _pbWriteDraft。
 
 流程：
 1. recursive list root folder（英文讀本資源 1Ymchv8TDiEeMYgsbSPDXALXe-PFCcOvx）下所有檔
-2. 收集 fileId set；對比 ALL 分頁 V 欄已知 fileId 找 orphans
-3. 寫 _PB_Draft 分頁：file_id / file_name / mime / folder_path（給 user review）
-4. Telegram 通知 N 個 orphan
+2. 對比 ALL V 欄已知 fileId 找 orphans
+3. 對每個 orphan 嘗試 guess title：
+   - epub: 下載 + parse content.opf → dc:title / dc:creator
+   - 其他: folder name 或檔名（去副檔名）
+4. 簡轉繁
+5. 寫 _PB_Draft 分頁（10 欄 schema 對齊原 GAS）
+6. Telegram 通知
 
-⚠️ 簡化點（vs GAS 原版）：
-- 不做 sentinel 偵測（原版要等 Python inbox_watcher.py 完成才觸發）
-- 不做 Gemini 輔助書目草稿（GAS 原版 _pbWriteDraft 用 Gemini parse epub）
-  → 只列 orphan、寫進 _PB_Draft 給 user 看，不自動寫進 ALL
-- 不做檔名 normalize（draft 就是原始檔名）
+⚠️ 簡化點（已標 TODO）：
+- 不用 Gemini API 智慧解析（原 GAS 也沒用、folder name 就夠）；若未來想啟用、加 GEMINI_API_KEY env + google-generativeai SDK
 
 env:
   COVER_UPDATER_DRY_RUN  1 = 只列、不寫 sheet
+  PB_PARSE_EPUB_META     1 = 對 .epub orphan 下載 + parse content.opf 補 title/author（耗時、預設 false）
 """
+import io
 import logging
 import os
+import re
 import time
+import zipfile
 from collections import Counter
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
 
 from utils.oauth import load_user_creds
 from utils.sheets import sheet_id
@@ -38,14 +41,13 @@ PICTUREBOOKS_ROOT_ID = "1Ymchv8TDiEeMYgsbSPDXALXe-PFCcOvx"
 MAIN_SHEET = "ALL"
 DRAFT_SHEET = "_PB_Draft"
 
-# 1-based columns in ALL
-COL_FILE_ID_ALL = 22  # V
+# 對應 GAS _PB
+SOURCE_VALUE = "Google Drive"
+STATUS_VALUE = "已擁有"
 
 
 def list_files_recursive(drive_service, root_id: str):
-    """遞迴列 root 下所有非 folder 檔案，回 list of dict {id, name, mimeType, path}。"""
     result = []
-    # path stack: [(folder_id, "/parent/path", folder_name)]
     stack = [(root_id, "", "")]
     visited = set()
 
@@ -62,7 +64,7 @@ def list_files_recursive(drive_service, root_id: str):
             try:
                 r = drive_service.files().list(
                     q=f"'{folder_id}' in parents and trashed=false",
-                    fields="nextPageToken, files(id, name, mimeType)",
+                    fields="nextPageToken, files(id, name, mimeType, webViewLink)",
                     pageSize=1000,
                     pageToken=page_token,
                     supportsAllDrives=True,
@@ -80,6 +82,7 @@ def list_files_recursive(drive_service, root_id: str):
                         "id": f["id"],
                         "name": f["name"],
                         "mime": f["mimeType"],
+                        "url": f.get("webViewLink", f"https://drive.google.com/file/d/{f['id']}/view"),
                         "path": current_path,
                     })
 
@@ -91,32 +94,103 @@ def list_files_recursive(drive_service, root_id: str):
 
 
 def ensure_draft_sheet(sheets_service, spreadsheet_id, dry_run):
-    """確保 _PB_Draft 分頁存在。"""
     meta = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     for s in meta.get("sheets", []):
         if s["properties"]["title"] == DRAFT_SHEET:
             return
     if dry_run:
-        logger.info(f"[picture_books] (dry_run) would create sheet '{DRAFT_SHEET}'")
         return
     sheets_service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
-        body={
-            "requests": [{"addSheet": {"properties": {"title": DRAFT_SHEET}}}],
-        },
+        body={"requests": [{"addSheet": {"properties": {"title": DRAFT_SHEET}}}]},
     ).execute()
+
+
+def parse_epub_meta_safe(epub_bytes):
+    """從 epub bytes 嘗試抽 title / author，失敗返 (None, None)。"""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(epub_bytes))
+    except zipfile.BadZipFile:
+        return None, None
+
+    opf_path = None
+    try:
+        container = z.read("META-INF/container.xml").decode("utf-8", errors="replace")
+        m = re.search(r'full-path="([^"]+\.opf)"', container, re.I)
+        if m:
+            opf_path = m.group(1)
+    except Exception:
+        pass
+    if not opf_path:
+        opfs = [n for n in z.namelist() if n.lower().endswith(".opf")]
+        if not opfs:
+            return None, None
+        opf_path = opfs[0]
+
+    try:
+        opf = z.read(opf_path).decode("utf-8", errors="replace")
+        t_m = re.search(r"<dc:title[^>]*>([^<]+)</dc:title>", opf, re.I | re.S)
+        a_m = re.search(r"<dc:creator[^>]*>([^<]+)</dc:creator>", opf, re.I | re.S)
+        title = t_m.group(1).strip() if t_m else None
+        author = a_m.group(1).strip() if a_m else None
+        return title, author
+    except Exception:
+        return None, None
+
+
+def guess_title_author(drive_service, orphan: dict, parse_epub: bool):
+    """
+    對 orphan 猜書名/作者。
+    - 如 PB_PARSE_EPUB_META=true 且 mime=epub → 下載 + parse content.opf
+    - fallback: folder name 或檔名（去副檔名）
+    """
+    title = None
+    author = ""
+
+    if parse_epub and orphan["mime"] == "application/epub+zip":
+        try:
+            request = drive_service.files().get_media(fileId=orphan["id"], supportsAllDrives=True)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            title, author = parse_epub_meta_safe(buf.getvalue())
+        except Exception as e:
+            logger.warning(f"  epub parse err {orphan['id']}: {e}")
+
+    if not title:
+        # folder name fallback
+        folder_name = orphan["path"].rstrip("/").split("/")[-1] if orphan["path"] else ""
+        if folder_name:
+            title = folder_name
+        else:
+            # 檔名去副檔名
+            title = re.sub(r"\.[^.]+$", "", orphan["name"])
+
+    return title or "", author or ""
+
+
+def to_traditional(text: str) -> str:
+    if not text:
+        return text
+    try:
+        from zhconv import convert
+        return convert(text, "zh-tw")
+    except Exception:
+        return text
 
 
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
+    parse_epub = os.environ.get("PB_PARSE_EPUB_META", "").lower() in ("1", "true", "yes")
 
     creds = load_user_creds()
     drive_service = build("drive", "v3", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 
-    # 1. recursive list root
-    logger.info(f"[picture_books] 開始 recursive list {PICTUREBOOKS_ROOT_ID}...")
+    logger.info(f"[picture_books] recursive list {PICTUREBOOKS_ROOT_ID} (parse_epub={parse_epub})...")
     start = time.time()
     files = list_files_recursive(drive_service, PICTUREBOOKS_ROOT_ID)
     logger.info(f"[picture_books] 共找到 {len(files)} 個檔案 ({time.time()-start:.0f}s)")
@@ -124,8 +198,7 @@ def run():
     if not files:
         return {"task": "picture_books", "targets": 0, "note": "no_files"}
 
-    # 2. 比對 ALL 分頁 V 欄已知 fileId
-    logger.info(f"[picture_books] 讀 ALL V 欄已知 fileId set...")
+    # 比對 ALL V 欄
     v_res = sheets_service.spreadsheets().values().get(
         spreadsheetId=sid, range=f"'{MAIN_SHEET}'!V2:V",
         valueRenderOption="UNFORMATTED_VALUE",
@@ -136,28 +209,52 @@ def run():
             known_fids.add(str(r[0]).strip())
     logger.info(f"[picture_books] ALL V 欄已有 fileId: {len(known_fids)}")
 
-    # 3. 找 orphans
     orphans = [f for f in files if f["id"] not in known_fids]
     logger.info(f"[picture_books] Orphans: {len(orphans)}")
 
     if not orphans:
         return {"task": "picture_books", "targets": 0, "stats": {"orphans": 0}, "note": "no_orphans"}
 
-    # 4. 寫 _PB_Draft
+    # 對每個 orphan guess title/author + 簡轉繁
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     ensure_draft_sheet(sheets_service, sid, dry_run)
 
-    rows = [["FileId", "FileName", "MimeType", "FolderPath"]]
+    # _PB_Draft schema（對齊 GAS）：
+    # A 書名(草稿) | B 作者(草稿) | C 語言 | D 來源 | E 狀態 | F FileId | G Drive URL | H 資料夾路徑 | I 建立時間 | J 操作
+    rows = [["書名(草稿)", "作者(草稿)", "語言", "來源", "狀態", "FileId", "Drive URL", "資料夾路徑", "建立時間", "操作"]]
+
+    s2t_changed = 0
     for o in orphans:
-        rows.append([o["id"], o["name"][:200], o["mime"], o["path"][:200]])
+        title, author = guess_title_author(drive_service, o, parse_epub)
+        orig_title = title
+        title = to_traditional(title)
+        author = to_traditional(author)
+        if orig_title != title:
+            s2t_changed += 1
+        rows.append([
+            title[:100],
+            author[:80],
+            "英文",  # 預設語言
+            SOURCE_VALUE,
+            STATUS_VALUE,
+            o["id"],
+            o["url"],
+            o["path"][:200],
+            ts,
+            "PENDING",
+        ])
+
+    if s2t_changed > 0:
+        logger.info(f"[picture_books] 🔁 簡→繁：{s2t_changed}/{len(orphans)} 筆 title 有變動")
 
     if dry_run:
-        logger.info(f"[picture_books] (dry_run) Would write {len(rows)} rows to {DRAFT_SHEET}")
-        return {"task": "picture_books", "targets": len(orphans), "stats": {"orphans": len(orphans), "dry_run": True}}
+        logger.info(f"[picture_books] (dry_run) 將寫 {len(rows)} 列到 {DRAFT_SHEET}")
+        return {"task": "picture_books", "targets": len(orphans), "stats": {"orphans": len(orphans), "s2t_changed": s2t_changed, "dry_run": True}}
 
     # clear + write
     try:
         sheets_service.spreadsheets().values().clear(
-            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!A:D",
+            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!A:J",
         ).execute()
     except HttpError:
         pass
@@ -169,11 +266,11 @@ def run():
         body={"values": rows},
     ).execute()
 
-    stats = Counter({"orphans": len(orphans), "rows_written": len(rows)})
-    logger.info(f"[picture_books] 完成 stats={dict(stats)}")
+    stats = {"orphans": len(orphans), "rows_written": len(rows), "s2t_changed": s2t_changed}
+    logger.info(f"[picture_books] 完成 stats={stats}")
     return {
         "task": "picture_books",
         "targets": len(orphans),
         "elapsed_sec": int(time.time() - start),
-        "stats": dict(stats),
+        "stats": stats,
     }

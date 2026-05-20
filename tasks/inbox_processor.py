@@ -260,7 +260,26 @@ def run():
             stats["parse_failed"] += 1
             continue
 
-        # TODO: 簡轉繁 (opencc) — 半夜 skip，user 起來決定加不加
+        # 簡轉繁（用 zhconv 純 Python）
+        try:
+            from zhconv import convert as zh_convert
+            if meta["title"]:
+                orig_t = meta["title"]
+                meta["title"] = zh_convert(orig_t, "zh-tw")
+                if orig_t != meta["title"]:
+                    logger.info(f"  🔁 title 簡→繁：{orig_t} → {meta['title']}")
+            if meta["author"]:
+                orig_a = meta["author"]
+                meta["author"] = zh_convert(orig_a, "zh-tw")
+                if orig_a != meta["author"]:
+                    logger.info(f"  🔁 author 簡→繁：{orig_a} → {meta['author']}")
+            if meta.get("series"):
+                orig_s = meta["series"]
+                meta["series"] = zh_convert(orig_s, "zh-tw")
+                if orig_s != meta["series"]:
+                    logger.info(f"  🔁 series 簡→繁：{orig_s} → {meta['series']}")
+        except Exception as e:
+            logger.warning(f"  簡轉繁失敗（保留原文）：{e}")
 
         raw_title = meta["title"]
         clean_author = normalize_author(meta["author"])

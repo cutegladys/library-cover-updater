@@ -36,6 +36,14 @@ MAX_FALLBACK = 20
 
 TW_TZ = timezone(timedelta(hours=8))
 
+# 顏色 (RGB 0-1 float 給 Sheets API)
+# 對應 healthDashboard.js _HD.COLOR
+COLOR_HEADER_BG = {"red": 0.102, "green": 0.451, "blue": 0.910}   # #1a73e8 Google 藍
+COLOR_HEADER_FG = {"red": 1.0, "green": 1.0, "blue": 1.0}          # #ffffff 白
+COLOR_SECTION_BG = {"red": 0.910, "green": 0.941, "blue": 0.996}   # #e8f0fe 淡藍
+COLOR_SECTION_FG = {"red": 0.102, "green": 0.451, "blue": 0.910}   # #1a73e8 藍
+COLOR_LABEL_FG = {"red": 0.373, "green": 0.388, "blue": 0.408}     # #5f6368 灰
+
 
 def now_tw_str():
     return datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
@@ -263,6 +271,121 @@ def assemble_dashboard(index_data, all_data, fb_data):
     return all_rows
 
 
+def apply_formatting(sheets_service, spreadsheet_id, sheet_id, content):
+    """套用 cell formatting：標題列藍底白字、區塊標題淺藍底藍字、label 灰 bold、凍結 + column width。"""
+    requests = []
+
+    # 1. 凍結首 2 列 + 標題列 column width
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": sheet_id,
+                "gridProperties": {"frozenRowCount": 2},
+            },
+            "fields": "gridProperties.frozenRowCount",
+        }
+    })
+
+    # column A 寬 200, column B 寬 400（pixel）
+    for col, width in [(0, 200), (1, 400)]:
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": col,
+                    "endIndex": col + 1,
+                },
+                "properties": {"pixelSize": width},
+                "fields": "pixelSize",
+            }
+        })
+
+    # 2. 第 1-2 列（標題 + 副標題）藍底白字 bold center
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": 2,
+                "startColumnIndex": 0,
+                "endColumnIndex": 5,
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": COLOR_HEADER_BG,
+                    "textFormat": {
+                        "foregroundColor": COLOR_HEADER_FG,
+                        "bold": True,
+                        "fontSize": 12,
+                    },
+                    "horizontalAlignment": "CENTER",
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+        }
+    })
+
+    # 3. 識別 section header rows（用 emoji prefix 判斷）
+    section_emojis = ("📊 ", "🖼️ ", "👻 ", "⚠️ ")
+    for i, row in enumerate(content):
+        if not row:
+            continue
+        first = str(row[0])
+        if first.startswith(section_emojis):
+            # section header 套淺藍底藍字 bold
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": i,
+                        "endRowIndex": i + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 5,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": COLOR_SECTION_BG,
+                            "textFormat": {
+                                "foregroundColor": COLOR_SECTION_FG,
+                                "bold": True,
+                                "fontSize": 11,
+                            },
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                }
+            })
+        elif len(row) >= 2 and row[1]:
+            # label/value row：A 欄 label 灰 bold
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": i,
+                        "endRowIndex": i + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {
+                                "foregroundColor": COLOR_LABEL_FG,
+                                "bold": True,
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.textFormat",
+                }
+            })
+
+    # batchUpdate 一次性送
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests},
+    ).execute()
+
+
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
 
@@ -310,6 +433,14 @@ def run():
     except HttpError as e:
         logger.error(f"[health_dashboard] write err: {e}")
         return {"task": "health_dashboard", "targets": 0, "stats": {"write_err": str(e)}}
+
+    # 套 formatting（背景色 / bold / 凍結 / column width）
+    dash_sheet_id = get_sheet_id_by_name(sheets_service, sid, DASH_SHEET)
+    if dash_sheet_id is not None:
+        try:
+            apply_formatting(sheets_service, sid, dash_sheet_id, content)
+        except HttpError as e:
+            logger.warning(f"[health_dashboard] formatting err（忽略，資料已寫）: {e}")
 
     logger.info(f"[health_dashboard] 完成，寫入 {len(content)} 列")
     return {
