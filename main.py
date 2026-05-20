@@ -113,6 +113,17 @@ def job_duplicate_merger():
     _run_task("duplicate_merger", duplicate_merger.run)
 
 
+def job_merge_queue_poller():
+    """D2 bridge — 不用 _run_task wrapper（成功也不發通知；merge_queue_poller 自己控制）。"""
+    try:
+        from tasks import merge_queue_poller
+        merge_queue_poller.run()
+    except Exception as e:
+        from utils.notify import notify_error
+        logger.error(f"merge_queue_poller exception: {e}")
+        notify_error(f"❌ merge_queue_poller 異常：{e}")
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -157,8 +168,15 @@ def register_schedules():
         os.environ.get("DUPLICATE_DETECTOR_AT_UTC", "18:00")
     ).do(job_duplicate_detector)
 
-    # duplicate_merger：不自動排程；要 LIVE_MERGE=true + RUN_ON_START=true Redeploy 手動觸發
-    # （未來 D2 Telegram bridge 上線後改 Telegram inline button 觸發 → 寫 sheet 旗標 → poll）
+    # merge_queue_poller：每 5 分鐘 poll _MergeQueue 分頁 A1（D2 Telegram bridge 後端）
+    # GAS 收到 Telegram callback "lib_merge_now" → 寫 _MergeQueue A1=pending
+    # → 此 poller 每 5 分鐘看一次 → pending 觸發 duplicate_merger（LIVE_MERGE 強制）
+    schedule.every(
+        int(os.environ.get("MERGE_QUEUE_POLL_MIN", "5"))
+    ).minutes.do(job_merge_queue_poller)
+
+    # duplicate_merger：不自動排程；由 merge_queue_poller 透過 D2 bridge 觸發、
+    # 或 LIVE_MERGE=true + RUN_ON_START=true Redeploy 手動觸發。
 
 
 def main():

@@ -24,7 +24,7 @@ from googleapiclient.errors import HttpError
 
 from utils.oauth import load_user_creds
 from utils.sheets import sheet_id
-from utils.notify import notify_error
+from utils.notify import notify_error, notify_with_buttons
 
 logger = logging.getLogger("library_cover_updater.duplicate_detector")
 
@@ -212,14 +212,22 @@ def run():
             body={"values": rows},
         ).execute()
 
-    # 通知（force=True，dedupe detection 重要訊息）
-    notify_error(
+    # 通知含 inline button（D2 Telegram bridge）
+    summary = (
         f"📋 Library 重複偵測完成\n"
         f"  auto_mergeable: {auto_count} 組（同 title+author）\n"
-        f"  manual_review: {manual_count} 組（title 同/author 不同）\n"
-        f"請查看 _DupCandidates 分頁。\n"
-        f"確認 OK 後：Zeabur dashboard 設 LIVE_MERGE=true + Redeploy 自動合併 AUTO-* 組。"
+        f"  manual_review: {manual_count} 組（title 同/author 不同）\n\n"
+        f"請先查看 _DupCandidates 分頁 review。\n"
+        f"點 ✅ 批准 → Zeabur 5 分鐘內自動合併 AUTO-* 組（merger 跑時也是 DRY_RUN 預設、實際合併要再 redeploy 設 LIVE_MERGE=true）。\n"
+        f"或請 user 直接到 Zeabur dashboard 設 LIVE_MERGE=true Redeploy 強制 live。"
     )
+    if auto_count > 0:
+        notify_with_buttons(summary, [[
+            {"text": "✅ 批准排隊合併", "callback_data": "lib_merge_now"},
+            {"text": "❌ 略過", "callback_data": "lib_merge_skip"},
+        ]])
+    else:
+        notify_error(summary)
 
     return {
         "task": "duplicate_detector",
