@@ -209,8 +209,20 @@ def run():
             known_fids.add(str(r[0]).strip())
     logger.info(f"[picture_books] ALL V 欄已有 fileId: {len(known_fids)}")
 
-    orphans = [f for f in files if f["id"] not in known_fids]
-    logger.info(f"[picture_books] Orphans: {len(orphans)}")
+    # 對齊 GAS _pbFindOrphans line 187-188：排除 _duplicates_quarantine 隔離資料夾
+    # （dedup 工具放的重複檔、非真實新繪本、不該算 orphan）
+    orphans = [
+        f for f in files
+        if f["id"] not in known_fids
+        and "_duplicates_quarantine" not in f.get("path", "")
+        and "_duplicates_quarantine" not in f.get("name", "")
+    ]
+    quarantine_skipped = sum(
+        1 for f in files
+        if f["id"] not in known_fids
+        and ("_duplicates_quarantine" in f.get("path", "") or "_duplicates_quarantine" in f.get("name", ""))
+    )
+    logger.info(f"[picture_books] Orphans: {len(orphans)}（已排除 _duplicates_quarantine {quarantine_skipped} 個）")
 
     if not orphans:
         return {"task": "picture_books", "targets": 0, "stats": {"orphans": 0}, "note": "no_orphans"}
