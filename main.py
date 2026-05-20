@@ -83,6 +83,11 @@ def job_auto_fill_links():
     _run_task("auto_fill_links", auto_fill_links.run)
 
 
+def job_folder_sync():
+    from tasks import folder_sync
+    _run_task("folder_sync", folder_sync.run)
+
+
 # ── schedule registration ──────────────────────────────────────
 
 def register_schedules():
@@ -102,9 +107,13 @@ def register_schedules():
         os.environ.get("AUTO_FILL_LINKS_AT_UTC", "22:00")
     ).do(job_auto_fill_links)
 
+    # folder_sync：每日 04:00 UTC = 每日 12:00 TW（Phase 3）
+    schedule.every().day.at(
+        os.environ.get("FOLDER_SYNC_AT_UTC", "04:00")
+    ).do(job_folder_sync)
+
     # TODO Phase 2: duplicate_detector 週二 18:00 UTC = 週三 02:00 TW
     # TODO Phase 2: merge_queue_poller 每 5 分鐘 poll _MergeQueue
-    # TODO Phase 3: folder_sync 每日 04:00 UTC = 12:00 TW
     # TODO Phase 4: picture_books / inbox_processor / health_dashboard
 
 
@@ -119,6 +128,7 @@ def main():
         job_cover_drive()
         job_cover_web()
         job_auto_fill_links()
+        job_folder_sync()
         # 未來其他 task 加上去
 
     while True:
