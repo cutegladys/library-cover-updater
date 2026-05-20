@@ -108,6 +108,16 @@ def job_duplicate_detector():
     _run_task("duplicate_detector", duplicate_detector.run)
 
 
+def job_pb_commit():
+    from tasks import pb_commit
+    _run_task("pb_commit", pb_commit.run)
+
+
+def job_drive_index():
+    from tasks import drive_index
+    _run_task("drive_index", drive_index.run)
+
+
 def job_duplicate_merger():
     from tasks import duplicate_merger
     _run_task("duplicate_merger", duplicate_merger.run)
@@ -158,10 +168,20 @@ def register_schedules():
         os.environ.get("INBOX_PROCESSOR_AT_UTC", "01:00")
     ).do(job_inbox_processor)
 
+    # drive_index：週四 17:00 UTC = 週五 01:00 TW（picture_books 前 1 小時、提供最新 Drive 檔案清單）
+    schedule.every().thursday.at(
+        os.environ.get("DRIVE_INDEX_AT_UTC", "17:00")
+    ).do(job_drive_index)
+
     # picture_books：週四 18:00 UTC = 週五 02:00 TW（Phase 4-1，原 GAS 每日 → Python 容器無 timeout 改週跑）
     schedule.every().thursday.at(
         os.environ.get("PICTURE_BOOKS_AT_UTC", "18:00")
     ).do(job_picture_books)
+
+    # pb_commit：每日 00:00 UTC = 每日 08:00 TW（picture_books 跑完隔天早上、user 一夜手動標完 APPROVED 後自動 commit）
+    schedule.every().day.at(
+        os.environ.get("PB_COMMIT_AT_UTC", "00:00")
+    ).do(job_pb_commit)
 
     # duplicate_detector：週二 18:00 UTC = 週三 02:00 TW（Phase 2）
     schedule.every().tuesday.at(
@@ -193,7 +213,9 @@ def main():
         job_folder_sync()
         job_health_dashboard()
         job_inbox_processor()
+        job_drive_index()
         job_picture_books()
+        job_pb_commit()
         job_duplicate_detector()
         # duplicate_merger 受 LIVE_MERGE env 控制、不放在這
         if os.environ.get("LIVE_MERGE", "").lower() in ("1", "true", "yes"):

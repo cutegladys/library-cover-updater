@@ -301,6 +301,26 @@ def run():
     else:
         notify_error(summary)
 
+    # manual_review 額外獨立通知（含 top 10 sample、強制合併 button）
+    # 對應 GAS scanForDuplicateBooks.js force_merge_book 邏輯（簡化版：global 強制合併、不分 per-book）
+    if manual_count > 0:
+        sample_lines = [f"⚠️ Library 有 {manual_count} 組「title 同/author 不同」需要人工 review："]
+        for i, g in enumerate(groups["manual_review"][:10], 1):
+            authors_str = " | ".join(g.get("unique_authors", []))[:80]
+            sample_lines.append(f"  {i}. 《{g['title'][:40]}》 → {authors_str}")
+        if manual_count > 10:
+            sample_lines.append(f"  ...另 {manual_count - 10} 組")
+        sample_lines.append("")
+        sample_lines.append("如要強制合併（不考慮 author 差異）→ 點 🔀；否則略過讓我手動處理。")
+        manual_msg = "\n".join(sample_lines)
+        try:
+            notify_with_buttons(manual_msg, [[
+                {"text": "🔀 強制合併（忽略 author）", "callback_data": "lib_force_merge_now"},
+                {"text": "❌ 略過", "callback_data": "lib_merge_skip"},
+            ]])
+        except Exception as e:
+            logger.warning(f"  manual_review 通知失敗：{e}")
+
     return {
         "task": "duplicate_detector",
         "targets": auto_count + manual_count,

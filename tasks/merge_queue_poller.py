@@ -80,17 +80,20 @@ def run():
     if status is None:
         return {"task": "merge_queue_poller", "targets": 0, "note": "no_queue_sheet"}
 
-    if status != "pending":
+    if status not in ("pending", "pending_force"):
         # 沒事做（空或 done_*）— 安靜返回，不發通知
         logger.info(f"[merge_queue_poller] queue status: '{status}' (skip)")
         return {"task": "merge_queue_poller", "targets": 0, "note": "no_pending"}
 
-    # 有 pending！跑 merger（強制 LIVE_MERGE）
-    logger.info("[merge_queue_poller] queue=pending，觸發 duplicate_merger LIVE_MERGE=true")
+    is_force = status == "pending_force"
+    logger.info(f"[merge_queue_poller] queue={status}，觸發 duplicate_merger LIVE_MERGE=true{' FORCE_MERGE=true' if is_force else ''}")
 
-    # 暫時設 env 確保 merger LIVE
+    # 暫時設 env 確保 merger LIVE（及可選 FORCE）
     orig_live = os.environ.get("LIVE_MERGE", "")
+    orig_force = os.environ.get("FORCE_MERGE", "")
     os.environ["LIVE_MERGE"] = "true"
+    if is_force:
+        os.environ["FORCE_MERGE"] = "true"
 
     try:
         from tasks import duplicate_merger
@@ -123,3 +126,7 @@ def run():
             os.environ["LIVE_MERGE"] = orig_live
         else:
             os.environ.pop("LIVE_MERGE", None)
+        if orig_force:
+            os.environ["FORCE_MERGE"] = orig_force
+        else:
+            os.environ.pop("FORCE_MERGE", None)

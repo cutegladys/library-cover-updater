@@ -38,6 +38,7 @@ logger = logging.getLogger("library_cover_updater.inbox_processor")
 
 EBOOK_ROOT_ID = "1N-CIlms9t6HHyui52682bAC-gzVmZH3H"
 INBOX_NAME = "_inbox"
+REVIEW_NAME = "_review"  # _inbox 下的子資料夾、放解析失敗的 epub
 MAIN_SHEET = "ALL"
 
 # 1-based columns
@@ -64,6 +65,23 @@ def find_subfolder(drive_service, parent_id: str, name: str):
     ).execute()
     files = r.get("files", [])
     return files[0]["id"] if files else None
+
+
+def get_or_create_subfolder(drive_service, parent_id: str, name: str) -> str:
+    """找 parent 下指定名稱的子資料夾、找不到就建。回 fileId。"""
+    fid = find_subfolder(drive_service, parent_id, name)
+    if fid:
+        return fid
+    r = drive_service.files().create(
+        body={
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        },
+        fields="id",
+        supportsAllDrives=True,
+    ).execute()
+    return r["id"]
 
 
 def list_epubs_in_folder(drive_service, folder_id: str):
@@ -219,7 +237,12 @@ def run():
         logger.warning(f"[inbox_processor] 找不到 _inbox 子資料夾 in {EBOOK_ROOT_ID}")
         return {"task": "inbox_processor", "targets": 0, "note": "no_inbox_folder"}
 
+    # _review 子資料夾（_inbox 下、放解析失敗的 epub）— dry_run 也建（idempotent）
+    review_id = get_or_create_subfolder(drive_service, inbox_id, REVIEW_NAME) if not dry_run else find_subfolder(drive_service, inbox_id, REVIEW_NAME)
+
     epubs = list_epubs_in_folder(drive_service, inbox_id)
+    # 過濾掉 _review 資料夾下的檔案（list_epubs_in_folder 只列 inbox 直接子層，但保險加 parents 過濾）
+    epubs = [f for f in epubs if review_id is None or review_id not in (f.get("parents") or [])]
     logger.info(f"[inbox_processor] _inbox 下 epub 數: {len(epubs)}")
 
     if not epubs:
@@ -256,8 +279,20 @@ def run():
 
         meta = parse_epub_meta(epub_bytes)
         if not meta:
-            logger.warning(f"  metadata 解析失敗")
+            logger.warning(f"  metadata 解析失敗 → 移入 _review")
             stats["parse_failed"] += 1
+            if not dry_run and review_id:
+                try:
+                    drive_service.files().update(
+                        fileId=file_id,
+                        addParents=review_id,
+                        removeParents=inbox_id,
+                        supportsAllDrives=True,
+                    ).execute()
+                    stats["moved_to_review"] += 1
+                except HttpError as e:
+                    logger.warning(f"  搬到 _review err: {e}")
+                    stats["move_review_err"] += 1
             continue
 
         # 簡轉繁（用 zhconv 純 Python）

@@ -17,9 +17,15 @@ Library 檔名同步 — 用 Drive fileId 查當前檔名、對齊 sheet A 欄
 env：
   COVER_UPDATER_DRY_RUN     1 = 只印不寫
   FOLDER_SYNC_MAX_PER_RUN   單次最多檢查多少列（預設 0 = 不限制；過去 GAS 受 6 分鐘 timeout 才有此參數）
+  FOLDER_SYNC_RETRY_TIMES   每筆 Drive API 失敗 retry 次數（預設 2、含原始呼叫共 3 次）
+  FOLDER_SYNC_RETRY_DELAY   retry 之間 sleep 秒數（預設 1.5）
+
+不可訪問的 fileId 會記入 inaccessibleFileIds set + Telegram 通知，
+避免每天 cron 重複打到 dead/permission denied 檔案。
 """
 import logging
 import os
+import random
 import re
 import time
 from collections import Counter
@@ -28,6 +34,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from utils.oauth import load_user_creds
+from utils.notify import notify_error
 from utils.sheets import (
     COL_TITLE, COL_SOURCE, COL_DRIVE_LINK,
     extract_file_id, sheet_id, read_all_rows,
@@ -43,9 +50,35 @@ def strip_ext(name: str) -> str:
     return EXT_RE.sub("", name).strip()
 
 
+def fetch_drive_meta_with_retry(drive_service, fid, retry_times: int, retry_delay: float):
+    """打 drive.files().get、5xx / 429 自動 retry。回 (meta, last_err_status)。"""
+    last_status = None
+    for attempt in range(retry_times + 1):
+        try:
+            meta = drive_service.files().get(
+                fileId=fid,
+                fields="name,trashed",
+                supportsAllDrives=True,
+            ).execute()
+            return meta, None
+        except HttpError as e:
+            last_status = e.resp.status
+            # 4xx（非 429）：no retry — permission denied / 404 / 等都是固定錯誤
+            if e.resp.status not in (429, 500, 502, 503, 504):
+                return None, last_status
+            if attempt < retry_times:
+                # exponential backoff + jitter
+                sleep_s = retry_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(f"  fileId={fid} status={e.resp.status} retry {attempt+1}/{retry_times} after {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+    return None, last_status
+
+
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
     max_per_run = int(os.environ.get("FOLDER_SYNC_MAX_PER_RUN", "0"))
+    retry_times = int(os.environ.get("FOLDER_SYNC_RETRY_TIMES", "2"))
+    retry_delay = float(os.environ.get("FOLDER_SYNC_RETRY_DELAY", "1.5"))
 
     creds = load_user_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
@@ -85,23 +118,26 @@ def run():
     updates = []  # batchUpdate body
     stats = Counter()
     start = time.time()
+    inaccessible_fids = []  # list of (row_num, fid, title, status)
 
     for i, (row_num, fid, title) in enumerate(candidates, 1):
-        try:
-            meta = drive_service.files().get(
-                fileId=fid,
-                fields="name,trashed",
-                supportsAllDrives=True,
-            ).execute()
-        except HttpError as e:
-            if e.resp.status == 404:
+        meta, err_status = fetch_drive_meta_with_retry(drive_service, fid, retry_times, retry_delay)
+        if meta is None:
+            if err_status == 404:
                 stats["dead_404"] += 1
+                inaccessible_fids.append((row_num, fid, title, "404 not found"))
+            elif err_status == 403:
+                stats["dead_403"] += 1
+                inaccessible_fids.append((row_num, fid, title, "403 permission denied"))
             else:
-                stats[f"meta_err_{e.resp.status}"] += 1
+                stats[f"meta_err_{err_status}"] += 1
+                if err_status:
+                    inaccessible_fids.append((row_num, fid, title, f"err {err_status}"))
             continue
 
         if meta.get("trashed"):
             stats["trashed"] += 1
+            inaccessible_fids.append((row_num, fid, title, "trashed"))
             continue
 
         current_name = meta.get("name", "")
@@ -151,9 +187,24 @@ def run():
 
     elapsed = time.time() - start
     logger.info(f"[folder_sync] 完成 elapsed={elapsed:.0f}s stats={dict(stats)}")
+
+    # 不可訪問檔案通知（前 20 筆 + Telegram）
+    if inaccessible_fids:
+        lines = [f"⚠️ folder_sync：{len(inaccessible_fids)} 個 Drive 檔案無法訪問（404/403/trashed）"]
+        for row_num, fid, title, reason in inaccessible_fids[:20]:
+            lines.append(f"  row {row_num} | {title[:40]} | {reason}")
+        if len(inaccessible_fids) > 20:
+            lines.append(f"  ...另 {len(inaccessible_fids) - 20} 筆")
+        lines.append("\n建議清空這些列的 U/V 欄、或從 ALL 移除（檔案已不存在）。")
+        try:
+            notify_error("\n".join(lines))
+        except Exception as e:
+            logger.warning(f"  inaccessible notify err: {e}")
+
     return {
         "task": "folder_sync",
         "targets": len(candidates),
         "elapsed_sec": int(elapsed),
         "stats": dict(stats),
+        "inaccessible_count": len(inaccessible_fids),
     }
