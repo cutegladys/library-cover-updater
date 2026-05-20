@@ -197,46 +197,92 @@ def run():
             "人工 review、決定 master row",
         ])
 
-    # ⚠️ 改 append-by-group-key（對齊 _Screenshot_Draft / _PB_Draft 行為，避免覆蓋 user review 標記）
-    # group key = title (lowered) + author (lowered)，已存在的 group 跳過
-    existing_keys = set()
+    # ⚠️ Reconcile 邏輯（保留 user 標記 + 自動清理已合併 / 已處理 group）
+    # 規則：
+    #   既有 in 當前 set → 保留（user 可能還在 review）
+    #   既有 NOT in 當前 set + 操作 ∈ (DONE, MERGED, REJECTED, IGNORED) → 刪（已處理）
+    #   既有 NOT in 當前 set + 預設值「自動合併 / 人工 review」 → 刪（表示已被 merge、不再重複）
+    #   新 group NOT in 既有 → append
+    existing_data = []  # list of (row_num, key, action)
     try:
         existing_res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!C2:D",
+            spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!A1:F",
             valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
-        for r in existing_res.get("values", []):
-            if r and len(r) >= 1:
-                title = str(r[0]).strip().lower()
-                author = (str(r[1]) if len(r) > 1 else "").strip().lower()
+        existing_vals = existing_res.get("values", [])
+        if existing_vals:
+            has_header_row = str(existing_vals[0][0] if len(existing_vals[0]) > 0 else "").strip() in ("Group",)
+            start_idx = 1 if has_header_row else 0
+            for i, r in enumerate(existing_vals[start_idx:], start=start_idx + 1):
+                while len(r) < 6:
+                    r.append("")
+                title = str(r[2]).strip().lower()
+                author = str(r[3]).strip().lower()
+                action = str(r[5]).strip().upper()
                 if title:
-                    existing_keys.add((title, author))
+                    existing_data.append((i, (title, author), action))
     except HttpError as e:
         if e.resp.status != 400:
             raise
 
-    logger.info(f"[duplicate_detector] _DupCandidates 既有 group: {len(existing_keys)}")
+    existing_key_set = {key for _, key, _ in existing_data}
+    current_keys = set()
+    for g in groups["auto_mergeable"]:
+        current_keys.add((g["title"].strip().lower(), g.get("author", "").strip().lower()))
+    for g in groups["manual_review"]:
+        current_keys.add((g["title"].strip().lower(), ""))  # title 同/author 不同類別、key 用 (title, "")
 
-    has_header = len(existing_keys) > 0
-    new_rows = [] if has_header else [rows[0]]
+    logger.info(f"[duplicate_detector] _DupCandidates 既有 {len(existing_data)} 列、當前 group {len(current_keys)}")
+
+    # 刪：既有 NOT in 當前 → 已被合併 / 已不重複（不管 action）
+    rows_to_delete = [row_num for row_num, key, _action in existing_data if key not in current_keys]
+    rows_to_delete.sort(reverse=True)
+
+    # Append：當前 NOT in 既有
+    new_rows = [r for r in rows[1:]
+                if (str(r[2]).strip().lower(), str(r[3]).strip().lower() if str(r[1]).startswith("title+author") else "") not in existing_key_set
+                and (str(r[2]).strip().lower(), "") not in existing_key_set]
+    # Note: 上面 key 邏輯複雜（auto vs manual key 不同），用更直接 fallback：兩種 key 都檢查
+    new_rows = []
     for r in rows[1:]:
-        title = str(r[2]).strip().lower() if len(r) > 2 else ""
-        author = str(r[3]).strip().lower() if len(r) > 3 else ""
-        if (title, author) in existing_keys:
-            continue
-        new_rows.append(r)
+        title_k = str(r[2]).strip().lower()
+        author_k = str(r[3]).strip().lower()
+        if r[1].startswith("title+author"):
+            key = (title_k, author_k)
+        else:
+            key = (title_k, "")
+        if key not in existing_key_set:
+            new_rows.append(r)
 
-    skipped_existing = (len(rows) - 1) - (len(new_rows) - (0 if has_header else 1))
-    logger.info(f"[duplicate_detector] 本次 append {len(new_rows) - (0 if has_header else 1)} 新 group、跳過 {skipped_existing} 既有")
+    has_header_existing = bool(existing_data) or (existing_vals and len(existing_vals[0]) > 0)
+    if not has_header_existing:
+        new_rows = [rows[0]] + new_rows
 
-    if not dry_run and new_rows:
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=sid,
-            range=f"'{CANDIDATES_SHEET}'!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": new_rows},
-        ).execute()
+    logger.info(f"[duplicate_detector] 計畫：append {len(new_rows)} 列、刪 {len(rows_to_delete)} 列已處理")
+
+    if not dry_run:
+        if rows_to_delete:
+            meta = sheets_service.spreadsheets().get(spreadsheetId=sid).execute()
+            dup_sheet_id = next((s["properties"]["sheetId"] for s in meta["sheets"]
+                                 if s["properties"]["title"] == CANDIDATES_SHEET), None)
+            if dup_sheet_id is not None:
+                delete_requests = [
+                    {"deleteDimension": {"range": {
+                        "sheetId": dup_sheet_id, "dimension": "ROWS",
+                        "startIndex": r - 1, "endIndex": r,
+                    }}} for r in rows_to_delete
+                ]
+                sheets_service.spreadsheets().batchUpdate(
+                    spreadsheetId=sid, body={"requests": delete_requests},
+                ).execute()
+        if new_rows:
+            sheets_service.spreadsheets().values().append(
+                spreadsheetId=sid,
+                range=f"'{CANDIDATES_SHEET}'!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": new_rows},
+            ).execute()
 
     # 通知含 inline button（D2 Telegram bridge）
     summary = (

@@ -247,49 +247,77 @@ def run():
     if s2t_changed > 0:
         logger.info(f"[picture_books] 🔁 簡→繁：{s2t_changed}/{len(orphans)} 筆 title 有變動")
 
-    # ⚠️ 改 append-by-fileid（對齊 _Screenshot_Draft / 原 _pbWriteDraft 行為）
-    # 讀既有 _PB_Draft，找 F 欄 (FileId) set，跳過已存在的 fileId
-    existing_fids = set()
+    # ⚠️ Reconcile 邏輯（對齊 _Screenshot_Draft / 原 _pbWriteDraft，保留 user 標記 + 自動清理已處理）
+    # 規則：
+    #   既有 in 當前 orphan set → 保留（user 可能還在 review）
+    #   既有 NOT in 當前 set + 操作 ∈ (APPROVED, DONE, REJECTED) → 刪（已處理）
+    #   既有 NOT in 當前 set + PENDING (or 空) → 保留（user 還沒看完、安全網）
+    #   新 orphan NOT in 既有 → append
+    existing_data = []  # list of (row_num, file_id, action)
     try:
         existing_res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!F2:F",
+            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!A1:J",
             valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
-        for r in existing_res.get("values", []):
-            if r and r[0]:
-                existing_fids.add(str(r[0]).strip())
+        existing_vals = existing_res.get("values", [])
+        # row index 從 2 起（Row 1 是 header）；如分頁無 header 則從 1
+        if existing_vals:
+            has_header_row = str(existing_vals[0][0] if len(existing_vals[0]) > 0 else "").strip() in ("書名(草稿)", "FileId", "BookTitle")
+            start_idx = 1 if has_header_row else 0
+            for i, r in enumerate(existing_vals[start_idx:], start=start_idx + 1):
+                while len(r) < 10:
+                    r.append("")
+                fid = str(r[5]).strip()
+                action = str(r[9]).strip().upper()
+                if fid:
+                    existing_data.append((i, fid, action))
     except HttpError as e:
-        if e.resp.status == 400:
-            # 分頁剛建、A2:F 空、視為無既有 fid
-            pass
-        else:
+        if e.resp.status != 400:
             raise
 
-    logger.info(f"[picture_books] _PB_Draft 既有 FileId: {len(existing_fids)}")
+    existing_fid_set = {fid for _, fid, _ in existing_data}
+    current_orphan_fids = {o["id"] for o in orphans}
+    logger.info(f"[picture_books] _PB_Draft 既有 {len(existing_data)} 列、當前 orphan {len(current_orphan_fids)} 個")
 
-    # 過濾：rows[0] 是 header（如分頁空、要寫一次 header）；之後 rows 每列 F 是 FileId
-    has_header = len(existing_fids) > 0 or rows[0][0] == "書名(草稿)"
-    # 重新組要 append 的 rows：跳過 fileId 已在 existing_fids 的
-    new_rows = []
+    # 找要刪的列（既有 NOT in 當前 + action 已處理）
+    DONE_ACTIONS = {"APPROVED", "DONE", "REJECTED", "COMMITTED"}
+    rows_to_delete = [row_num for row_num, fid, action in existing_data
+                      if fid not in current_orphan_fids and action in DONE_ACTIONS]
+    rows_to_delete.sort(reverse=True)  # 從大 row_num 開始刪（避免 index shift）
+
+    # 找要 append 的：新 orphan NOT in 既有 fid
+    new_rows = [r for r in rows[1:] if str(r[5]).strip() not in existing_fid_set]
+    has_header = bool(existing_data) or (existing_res.get("values", []) and len(existing_res.get("values", [])[0]) > 0)
     if not has_header:
-        # 分頁空、先寫 header
-        new_rows.append(rows[0])
-    for r in rows[1:]:
-        fid = r[5] if len(r) > 5 else ""
-        if str(fid).strip() in existing_fids:
-            continue
-        new_rows.append(r)
+        new_rows = [rows[0]] + new_rows  # 寫 header
 
-    appended = len(new_rows) - (1 if not has_header else 0)
-    skipped = len(orphans) - appended
-    logger.info(f"[picture_books] 本次 append {appended} 列、跳過 {skipped} 既有 fileId")
+    logger.info(f"[picture_books] 計畫：append {len(new_rows)} 列、刪 {len(rows_to_delete)} 列已處理（剩餘 PENDING/未標記 保留）")
 
     if dry_run:
-        logger.info(f"[picture_books] (dry_run) 將 append {len(new_rows)} 列到 {DRAFT_SHEET}")
-        return {"task": "picture_books", "targets": len(orphans), "stats": {"orphans": len(orphans), "appended": appended, "skipped": skipped, "s2t_changed": s2t_changed, "dry_run": True}}
+        return {"task": "picture_books", "targets": len(orphans), "stats": {
+            "orphans": len(orphans), "append_planned": len(new_rows),
+            "delete_planned": len(rows_to_delete), "s2t_changed": s2t_changed, "dry_run": True,
+        }}
 
+    # 1. 刪已處理列（用 batchUpdate deleteDimension）
+    if rows_to_delete:
+        # 拿 _PB_Draft 的 sheetId
+        meta = sheets_service.spreadsheets().get(spreadsheetId=sid).execute()
+        pb_sheet_id = next((s["properties"]["sheetId"] for s in meta["sheets"]
+                            if s["properties"]["title"] == DRAFT_SHEET), None)
+        if pb_sheet_id is not None:
+            delete_requests = [
+                {"deleteDimension": {"range": {
+                    "sheetId": pb_sheet_id, "dimension": "ROWS",
+                    "startIndex": r - 1, "endIndex": r,
+                }}} for r in rows_to_delete
+            ]
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=sid, body={"requests": delete_requests},
+            ).execute()
+
+    # 2. Append 新 orphan
     if new_rows:
-        # 用 append 而非 update（保留既有 + user PENDING/APPROVED 標記）
         sheets_service.spreadsheets().values().append(
             spreadsheetId=sid,
             range=f"'{DRAFT_SHEET}'!A1",
@@ -298,7 +326,13 @@ def run():
             body={"values": new_rows},
         ).execute()
 
-    stats = {"orphans": len(orphans), "appended": appended, "skipped_existing": skipped, "s2t_changed": s2t_changed}
+    stats = {
+        "orphans": len(orphans),
+        "appended": len(new_rows),
+        "deleted_done": len(rows_to_delete),
+        "kept_existing": len(existing_data) - len(rows_to_delete),
+        "s2t_changed": s2t_changed,
+    }
     logger.info(f"[picture_books] 完成 stats={stats}")
     return {
         "task": "picture_books",
