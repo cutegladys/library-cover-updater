@@ -148,25 +148,15 @@ def register_schedules():
         os.environ.get("COVER_WEB_AT_UTC", "18:00")
     ).do(job_cover_web)
 
-    # auto_fill_links：每日 22:00 UTC = 每日 06:00 TW（Phase 4-3）
-    schedule.every().day.at(
-        os.environ.get("AUTO_FILL_LINKS_AT_UTC", "22:00")
-    ).do(job_auto_fill_links)
+    # ⚠️ 以下 3 個 task 已搬回主帳號 GAS（2026-05-21 對焦後決策）：
+    #   auto_fill_links / health_dashboard / inbox_processor
+    # 理由：純 Sheets / 0 UrlFetch、Zeabur 沒比較好。程式碼留作備援、不註冊 schedule。
+    # 對應 GAS：restoreHealthyTriggers.js → restoreHealthyLibraryTriggers()
 
     # folder_sync：每日 04:00 UTC = 每日 12:00 TW（Phase 3）
     schedule.every().day.at(
         os.environ.get("FOLDER_SYNC_AT_UTC", "04:00")
     ).do(job_folder_sync)
-
-    # health_dashboard：每日 15:00 UTC = 每日 23:00 TW（Phase 4-4）
-    schedule.every().day.at(
-        os.environ.get("HEALTH_DASHBOARD_AT_UTC", "15:00")
-    ).do(job_health_dashboard)
-
-    # inbox_processor：每日 01:00 UTC = 每日 09:00 TW（Phase 4-2，原 GAS 時間）
-    schedule.every().day.at(
-        os.environ.get("INBOX_PROCESSOR_AT_UTC", "01:00")
-    ).do(job_inbox_processor)
 
     # drive_index：週四 17:00 UTC = 週五 01:00 TW（picture_books 前 1 小時、提供最新 Drive 檔案清單）
     schedule.every().thursday.at(
@@ -209,10 +199,8 @@ def main():
         logger.info("RUN_ON_START=true，立即跑一次所有 task")
         job_cover_drive()
         job_cover_web()
-        job_auto_fill_links()
+        # auto_fill_links / health_dashboard / inbox_processor 已搬回主帳號 GAS、Zeabur 不跑
         job_folder_sync()
-        job_health_dashboard()
-        job_inbox_processor()
         job_drive_index()
         job_picture_books()
         job_pb_commit()
