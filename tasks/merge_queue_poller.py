@@ -12,6 +12,7 @@ Telegram inline button → GAS → sheet 旗標 → Zeabur poll → merger → �
 """
 import logging
 import os
+import random
 import time
 
 from googleapiclient.discovery import build
@@ -26,25 +27,61 @@ logger = logging.getLogger("library_cover_updater.merge_queue_poller")
 QUEUE_SHEET = "_MergeQueue"
 QUEUE_CELL = f"'{QUEUE_SHEET}'!A1"
 
+# Sheets transient errors — 409 (concurrent edit / aborted), 429 (rate), 5xx
+_RETRYABLE_STATUSES = (409, 429, 500, 502, 503, 504)
+
+
+def _execute_with_retry(request, *, label: str, retry_times: int = 3, retry_delay: float = 1.5):
+    """
+    對 googleapiclient request 呼叫 .execute()，遇 transient (409/429/5xx) 自動 retry。
+    其他 HttpError 直接 raise。retry 全部用完仍失敗 → raise 最後一次的例外。
+    """
+    last_exc = None
+    for attempt in range(retry_times + 1):
+        try:
+            return request.execute()
+        except HttpError as e:
+            last_exc = e
+            status = e.resp.status
+            if status not in _RETRYABLE_STATUSES:
+                raise
+            if attempt < retry_times:
+                sleep_s = retry_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(
+                    f"[merge_queue_poller] {label} HTTP {status} retry "
+                    f"{attempt+1}/{retry_times} after {sleep_s:.1f}s"
+                )
+                time.sleep(sleep_s)
+    raise last_exc
+
 
 def ensure_queue_sheet(sheets_service, spreadsheet_id):
     """確保 _MergeQueue 分頁存在。"""
-    meta = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute_with_retry(
+        sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        label="ensure_queue_sheet.get",
+    )
     for s in meta.get("sheets", []):
         if s["properties"]["title"] == QUEUE_SHEET:
             return
-    sheets_service.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"requests": [{"addSheet": {"properties": {"title": QUEUE_SHEET}}}]},
-    ).execute()
+    _execute_with_retry(
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": QUEUE_SHEET}}}]},
+        ),
+        label="ensure_queue_sheet.batchUpdate",
+    )
 
 
 def read_queue_status(sheets_service, sid):
     """讀 A1 cell 字串。"""
     try:
-        r = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sid, range=QUEUE_CELL,
-        ).execute()
+        r = _execute_with_retry(
+            sheets_service.spreadsheets().values().get(
+                spreadsheetId=sid, range=QUEUE_CELL,
+            ),
+            label="read_queue_status",
+        )
         vals = r.get("values", [])
         if vals and vals[0]:
             return str(vals[0][0]).strip()
@@ -57,11 +94,14 @@ def read_queue_status(sheets_service, sid):
 
 
 def write_queue_status(sheets_service, sid, status: str):
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=sid, range=QUEUE_CELL,
-        valueInputOption="RAW",
-        body={"values": [[status]]},
-    ).execute()
+    _execute_with_retry(
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=sid, range=QUEUE_CELL,
+            valueInputOption="RAW",
+            body={"values": [[status]]},
+        ),
+        label="write_queue_status",
+    )
 
 
 def run():
