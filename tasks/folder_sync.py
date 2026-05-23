@@ -36,7 +36,7 @@ from googleapiclient.errors import HttpError
 from utils.oauth import load_user_creds
 from utils.notify import notify_error
 from utils.sheets import (
-    COL_TITLE, COL_SOURCE, COL_DRIVE_LINK,
+    COL_TITLE, COL_SOURCE, COL_MARKER, COL_DRIVE_LINK,
     extract_file_id, sheet_id, read_all_rows,
 )
 
@@ -90,22 +90,28 @@ def run():
     logger.info(f"[folder_sync] Total rows: {len(rows)} (dry_run={dry_run})")
 
     # 收集 (row_num, fileId, title) tuples 要打 Drive API 查
+    # 跳過 T 欄已標 DRIVE_GONE 的列（永久消失、不再重打）
     candidates = []
+    skipped_drive_gone = 0
     for idx, row in enumerate(rows, start=2):
         while len(row) <= COL_DRIVE_LINK:
             row.append("")
         title = str(row[COL_TITLE]).strip()
         source = str(row[COL_SOURCE]).strip()
+        marker = str(row[COL_MARKER]).strip()
         if source != SOURCE_FILTER:
             continue
         if not title:
+            continue
+        if marker == "DRIVE_GONE":
+            skipped_drive_gone += 1
             continue
         fid = extract_file_id(str(row[COL_DRIVE_LINK]))
         if not fid:
             continue
         candidates.append((idx, fid, title))
 
-    logger.info(f"[folder_sync] Candidates (Source=Google Drive + has fileId): {len(candidates)}")
+    logger.info(f"[folder_sync] Candidates (Source=Google Drive + has fileId, marker!=DRIVE_GONE): {len(candidates)} (skipped DRIVE_GONE={skipped_drive_gone})")
 
     if max_per_run > 0:
         candidates = candidates[:max_per_run]
@@ -166,12 +172,19 @@ def run():
     elapsed = time.time() - start
     logger.info(f"[folder_sync] 比對完成 elapsed={elapsed:.0f}s, 待更新 {len(updates)} 筆")
 
+    # 把這次新發現不可訪問的列 T 欄打 DRIVE_GONE marker，下次 cron 自動跳過
+    marker_updates = [
+        {"range": f"'ALL'!T{row_num}", "values": [["DRIVE_GONE"]]}
+        for row_num, _fid, _title, _reason in inaccessible_fids
+    ]
+    all_updates = updates + marker_updates
+
     # batchUpdate 一次寫回（dry-run 時跳過）
-    if updates and not dry_run:
+    if all_updates and not dry_run:
         # batchUpdate 上限 Sheets API 預設沒嚴格上限，但 1000+ 個 range 可能超 quota，分批
         BATCH = 500
-        for i in range(0, len(updates), BATCH):
-            chunk = updates[i:i + BATCH]
+        for i in range(0, len(all_updates), BATCH):
+            chunk = all_updates[i:i + BATCH]
             try:
                 sheets_service.spreadsheets().values().batchUpdate(
                     spreadsheetId=sid,
@@ -184,18 +197,18 @@ def run():
             except HttpError as e:
                 stats[f"write_err_{e.resp.status}"] += 1
                 logger.warning(f"[folder_sync] batchUpdate err {e.resp.status}: {e}")
+    stats["marker_drive_gone_new"] = len(marker_updates)
 
     elapsed = time.time() - start
     logger.info(f"[folder_sync] 完成 elapsed={elapsed:.0f}s stats={dict(stats)}")
 
-    # 不可訪問檔案通知（前 20 筆 + Telegram）
+    # 不可訪問檔案通知：只在「這次新發現」時發一次（DRIVE_GONE 已標的列上面已跳過）
     if inaccessible_fids:
-        lines = [f"⚠️ folder_sync：{len(inaccessible_fids)} 個 Drive 檔案無法訪問（404/403/trashed）"]
+        lines = [f"⚠️ folder_sync：本次新發現 {len(inaccessible_fids)} 個 Drive 檔案無法訪問（404/403/trashed），已自動標 T=DRIVE_GONE，未來 cron 不再重打"]
         for row_num, fid, title, reason in inaccessible_fids[:20]:
             lines.append(f"  row {row_num} | {title[:40]} | {reason}")
         if len(inaccessible_fids) > 20:
             lines.append(f"  ...另 {len(inaccessible_fids) - 20} 筆")
-        lines.append("\n建議清空這些列的 U/V 欄、或從 ALL 移除（檔案已不存在）。")
         try:
             notify_error("\n".join(lines))
         except Exception as e:
