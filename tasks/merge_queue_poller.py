@@ -13,6 +13,8 @@ Telegram inline button → GAS → sheet 旗標 → Zeabur poll → merger → �
 import logging
 import os
 import random
+import socket
+import ssl
 import time
 
 from googleapiclient.discovery import build
@@ -52,6 +54,17 @@ def _execute_with_retry(request, *, label: str, retry_times: int = 3, retry_dela
                     f"{attempt+1}/{retry_times} after {sleep_s:.1f}s"
                 )
                 time.sleep(sleep_s)
+        except (socket.timeout, TimeoutError, ssl.SSLError, ConnectionError, OSError) as e:
+            last_exc = e
+            if attempt < retry_times:
+                sleep_s = retry_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(
+                    f"[merge_queue_poller] {label} network {type(e).__name__}: {e} "
+                    f"retry {attempt+1}/{retry_times} after {sleep_s:.1f}s"
+                )
+                time.sleep(sleep_s)
+            else:
+                raise
     raise last_exc
 
 
