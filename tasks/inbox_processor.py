@@ -184,6 +184,19 @@ def parse_epub_meta(epub_bytes: bytes):
     }
 
 
+def is_pdf_truncated(pdf_bytes: bytes) -> bool:
+    """檢查 PDF 末尾 2KB 有沒有 %%EOF / startxref。
+
+    截斷的 PDF（下載中斷）兩個結構都會缺；PyMuPDF 開檔可能仍部分讀得到 metadata，
+    但 render 第 1 頁通常會炸；最好提早攔下、通知 user 重下。
+    """
+    if len(pdf_bytes) < 100:
+        return True  # 太小直接視為壞
+    tail = pdf_bytes[-2048:]
+    s = tail.decode("latin-1", errors="ignore")
+    return ("%%EOF" not in s) and ("startxref" not in s)
+
+
 def parse_pdf_meta(pdf_bytes: bytes, fallback_filename: str = ""):
     """解析 PDF metadata → title / author / lang。失敗返 None。
 
@@ -353,6 +366,23 @@ def run():
             continue
 
         if kind == "pdf":
+            # 預檢：截斷 PDF（下載中斷）直接搬 _review、不浪費後續處理
+            if is_pdf_truncated(file_bytes):
+                logger.warning(f"  ⚠️ PDF 截斷（檔尾無 %%EOF/startxref）→ 移入 _review")
+                stats["pdf_truncated"] += 1
+                if not dry_run and review_id:
+                    try:
+                        drive_service.files().update(
+                            fileId=file_id,
+                            addParents=review_id,
+                            removeParents=inbox_id,
+                            supportsAllDrives=True,
+                        ).execute()
+                        stats["moved_to_review"] += 1
+                    except HttpError as e:
+                        logger.warning(f"  搬到 _review err: {e}")
+                        stats["move_review_err"] += 1
+                continue
             meta = parse_pdf_meta(file_bytes, fallback_filename=orig_name)
         else:
             meta = parse_epub_meta(file_bytes)
@@ -468,9 +498,21 @@ def run():
             stats["move_err"] += 1
 
     logger.info(f"[inbox_processor] 完成 stats={dict(stats)}")
+
+    # 截斷的 PDF 走 notify_error 強推（user 才會看到）
+    if stats.get("pdf_truncated", 0) > 0 and not dry_run:
+        try:
+            from utils.notify import notify_error
+            notify_error(
+                f"⚠️ inbox_processor 偵測到 {stats['pdf_truncated']} 個截斷的 PDF（檔尾無 %%EOF）\n"
+                f"已搬到 eBookReading/_inbox/_review/，請重新下載完整版後再丟回 _inbox"
+            )
+        except Exception as e:
+            logger.warning(f"truncated PDF 通知失敗：{e}")
+
     return {
         "task": "inbox_processor",
-        "targets": len(epubs),
+        "targets": len(books),
         "elapsed_sec": 0,
         "stats": dict(stats),
     }
