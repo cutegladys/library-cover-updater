@@ -284,6 +284,39 @@ def run():
                 body={"values": new_rows},
             ).execute()
 
+        # ── Group 編號 reconcile（修撞號 bug）─────────────────────────────
+        # 既有 row 保留舊編號 + 新 append row 從 1 重新 enumerate → 不同次 scan 寫入會撞號
+        # （例 MANUAL-2 出現兩本不同書）。修法：append 完整體再讀一次 A/B 欄，
+        # 按 row 順序對 AUTO / MANUAL 各自重編，只寫回 A 欄（保留 Action 欄 user 標記）。
+        try:
+            cur = sheets_service.spreadsheets().values().get(
+                spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!A1:B",
+                valueRenderOption="UNFORMATTED_VALUE",
+            ).execute().get("values", [])
+            if len(cur) > 1:
+                auto_n = 0
+                manual_n = 0
+                new_col_a = [["Group"]]  # header
+                for r in cur[1:]:
+                    typ = str(r[1] if len(r) > 1 else "").strip()
+                    if typ.startswith("title+author"):
+                        auto_n += 1
+                        new_col_a.append([f"AUTO-{auto_n}"])
+                    elif typ.startswith("title"):
+                        manual_n += 1
+                        new_col_a.append([f"MANUAL-{manual_n}"])
+                    else:
+                        new_col_a.append([r[0] if len(r) > 0 else ""])
+                sheets_service.spreadsheets().values().update(
+                    spreadsheetId=sid,
+                    range=f"'{CANDIDATES_SHEET}'!A1:A{len(new_col_a)}",
+                    valueInputOption="RAW",
+                    body={"values": new_col_a},
+                ).execute()
+                logger.info(f"[duplicate_detector] Group 編號 reconcile：AUTO={auto_n}, MANUAL={manual_n}")
+        except Exception as e:
+            logger.warning(f"[duplicate_detector] Group 編號 reconcile 失敗（不影響合併）：{e}")
+
     # 通知含 inline button（D2 Telegram bridge）
     summary = (
         f"📋 Library 重複偵測完成\n"
