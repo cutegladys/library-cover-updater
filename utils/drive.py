@@ -57,8 +57,13 @@ def upload_cover(drive_service, name: str, content_bytes: bytes, mime: str) -> s
 
 
 def image_formula_for_drive_file(file_id: str) -> str:
-    """直連 Drive 檔當圖片（image/* mime 或上傳到 Cover folder 的圖）。"""
-    return f'=IMAGE("https://drive.google.com/uc?export=view&id={file_id}")'
+    """直連 Drive 檔當圖片（image/* mime 或上傳到 Cover folder 的圖）。
+
+    用 lh3.googleusercontent.com/d/<id>=w600 — 直接回 image、無 redirect。
+    之前用 drive.google.com/uc?export=view 會 303 redirect 到 drive.usercontent，
+    Telegram link-preview fetcher 不跟 → bot 顯示無封面（2026-05-27 修正）。
+    """
+    return f'=IMAGE("https://lh3.googleusercontent.com/d/{file_id}=w600")'
 
 
 def image_formula_for_thumbnail(thumbnail_link: str) -> str:
