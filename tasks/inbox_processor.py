@@ -33,6 +33,8 @@ from googleapiclient.http import MediaIoBaseDownload
 from utils.oauth import load_user_creds
 from utils.sheets import sheet_id
 from utils.normalizer import normalize_filename, normalize_author, build_filename
+from utils.drive import upload_cover, safe_name, image_formula_for_drive_file
+from tasks.cover_drive import render_pdf_first_page
 
 logger = logging.getLogger("library_cover_updater.inbox_processor")
 
@@ -84,8 +86,14 @@ def get_or_create_subfolder(drive_service, parent_id: str, name: str) -> str:
     return r["id"]
 
 
-def list_epubs_in_folder(drive_service, folder_id: str):
-    """列出 folder 下所有 .epub（含 mime=epub 跟副檔名 .epub）。"""
+def list_books_in_folder(drive_service, folder_id: str):
+    """列出 folder 下所有 .pdf（含對應 mime 與副檔名）。
+
+    分工：epub 走 GAS Library/inboxProcessor.js（0 UrlFetch、已穩定）；
+    pdf 走 Python（PyMuPDF metadata + 封面渲染一次到位）。
+    epub 在 Python 端不處理（防止雙跑）。
+    每筆額外帶 `book_kind`，目前永遠是 'pdf'，主迴圈仍 keep 分流欄保留擴充空間。
+    """
     r = drive_service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id, name, mimeType, webViewLink, parents)",
@@ -93,13 +101,15 @@ def list_epubs_in_folder(drive_service, folder_id: str):
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
     ).execute()
-    epubs = []
+    books = []
     for f in r.get("files", []):
         name = f.get("name", "")
         mt = f.get("mimeType", "")
-        if mt == "application/epub+zip" or name.lower().endswith(".epub"):
-            epubs.append(f)
-    return epubs
+        lower = name.lower()
+        if mt == "application/pdf" or lower.endswith(".pdf"):
+            f["book_kind"] = "pdf"
+            books.append(f)
+    return books
 
 
 def download_to_bytes(drive_service, file_id: str) -> bytes:
@@ -174,6 +184,65 @@ def parse_epub_meta(epub_bytes: bytes):
     }
 
 
+def parse_pdf_meta(pdf_bytes: bytes, fallback_filename: str = ""):
+    """解析 PDF metadata → title / author / lang。失敗返 None。
+
+    1. PyMuPDF doc.metadata：title / author / subject / keywords / language
+    2. metadata 空白時從檔名 fallback（去掉副檔名與括號中段）
+    3. 結尾 title 仍空 → None（讓主迴圈搬 _review）
+    """
+    import fitz
+    title = ""
+    author = ""
+    lang = ""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            md = doc.metadata or {}
+            title = (md.get("title") or "").strip()
+            author = (md.get("author") or "").strip()
+            # PDF 沒有標準 language 欄；偶爾在 Lang 屬性
+            lang = ""
+        finally:
+            doc.close()
+    except Exception as e:
+        logger.warning(f"  parse_pdf_meta PyMuPDF err: {e}")
+        # 不直接 return None — 還有檔名 fallback 可以救
+
+    if not title and fallback_filename:
+        # 從檔名抽：去 .pdf、去結尾的 ()、把 _ - 變空格
+        base = re.sub(r"\.pdf$", "", fallback_filename, flags=re.I)
+        base = re.sub(r"\s*\([^)]*\)\s*$", "", base).strip()
+        if base:
+            title = base
+
+    if not title:
+        return None
+
+    return {
+        "title": title,
+        "author": author,
+        "lang": lang,
+        "series": "",
+        "series_index": "",
+    }
+
+
+def render_and_upload_pdf_cover(drive_service, pdf_bytes: bytes, title: str):
+    """PDF 第 1 頁 render → 上傳到 Cover Art folder → 回 IMAGE() 公式字串。
+    失敗返 None（主迴圈會 fallback 到 Drive thumbnail）。
+    """
+    try:
+        png = render_pdf_first_page(pdf_bytes)
+        if not png:
+            return None
+        cover_id = upload_cover(drive_service, safe_name(title) + ".png", png, "image/png")
+        return image_formula_for_drive_file(cover_id)
+    except Exception as e:
+        logger.warning(f"  render_and_upload_pdf_cover err: {e}")
+        return None
+
+
 def is_duplicate(all_data, title: str, author: str) -> bool:
     """檢查 ALL 是否已有同書名+同作者。"""
     t = title.lower().strip()
@@ -188,7 +257,11 @@ def is_duplicate(all_data, title: str, author: str) -> bool:
 
 
 def append_to_all(sheets_service, sid: str, last_row: int, info: dict):
-    """append 一列到 ALL。注意 Sheets API 用 USER_ENTERED 寫 URL 會自動變超連結。"""
+    """append 一列到 ALL。注意 Sheets API 用 USER_ENTERED 寫 URL 會自動變超連結。
+
+    info 可選 cover_formula：呼叫端已渲染好的封面公式（PDF 用），有就直接用，
+    沒有就退回 Drive thumbnail（epub 用，後續會被 cover_drive 改寫成真封面）。
+    """
     new_row = last_row + 1
     # 一次寫多 cell 用 batchUpdate
     updates = [
@@ -200,8 +273,8 @@ def append_to_all(sheets_service, sid: str, last_row: int, info: dict):
         {"range": f"'{MAIN_SHEET}'!U{new_row}", "values": [[info["url"]]]},
         {"range": f"'{MAIN_SHEET}'!V{new_row}", "values": [[info["file_id"]]]},
     ]
-    # 簡易封面：thumbnailLink-based formula（避免依賴 Drive metadata API）
-    cover_formula = f'=IMAGE("https://drive.google.com/thumbnail?id={info["file_id"]}&sz=w400")'
+    cover_formula = info.get("cover_formula") or \
+        f'=IMAGE("https://drive.google.com/thumbnail?id={info["file_id"]}&sz=w400")'
     updates.append({"range": f"'{MAIN_SHEET}'!Q{new_row}", "values": [[cover_formula]]})
 
     sheets_service.spreadsheets().values().batchUpdate(
@@ -240,15 +313,16 @@ def run():
     # _review 子資料夾（_inbox 下、放解析失敗的 epub）— dry_run 也建（idempotent）
     review_id = get_or_create_subfolder(drive_service, inbox_id, REVIEW_NAME) if not dry_run else find_subfolder(drive_service, inbox_id, REVIEW_NAME)
 
-    epubs = list_epubs_in_folder(drive_service, inbox_id)
-    # 過濾掉 _review 資料夾下的檔案（list_epubs_in_folder 只列 inbox 直接子層，但保險加 parents 過濾）
-    epubs = [f for f in epubs if review_id is None or review_id not in (f.get("parents") or [])]
-    logger.info(f"[inbox_processor] _inbox 下 epub 數: {len(epubs)}")
+    books = list_books_in_folder(drive_service, inbox_id)
+    # 過濾掉 _review 資料夾下的檔案（list_books_in_folder 只列 inbox 直接子層，但保險加 parents 過濾）
+    books = [f for f in books if review_id is None or review_id not in (f.get("parents") or [])]
+    n_pdf = sum(1 for f in books if f["book_kind"] == "pdf")
+    logger.info(f"[inbox_processor] _inbox 下 pdf={n_pdf} (epub 由 GAS 處理、Python 端跳過)")
 
-    if not epubs:
+    if not books:
         return {"task": "inbox_processor", "targets": 0, "note": "no_new_books"}
 
-    epubs = epubs[:limit]
+    books = books[:limit]
 
     # 讀 ALL 看重複
     all_res = sheets_service.spreadsheets().values().get(
@@ -264,20 +338,24 @@ def run():
 
     stats = Counter()
 
-    for f in epubs:
+    for f in books:
         orig_name = f["name"]
         file_id = f["id"]
-        logger.info(f"[inbox_processor] 處理: {orig_name}")
+        kind = f["book_kind"]  # 'epub' or 'pdf'
+        logger.info(f"[inbox_processor] 處理: {orig_name} ({kind})")
 
         # Download + parse
         try:
-            epub_bytes = download_to_bytes(drive_service, file_id)
+            file_bytes = download_to_bytes(drive_service, file_id)
         except HttpError as e:
             logger.warning(f"  download err: {e}")
             stats["download_err"] += 1
             continue
 
-        meta = parse_epub_meta(epub_bytes)
+        if kind == "pdf":
+            meta = parse_pdf_meta(file_bytes, fallback_filename=orig_name)
+        else:
+            meta = parse_epub_meta(file_bytes)
         if not meta:
             logger.warning(f"  metadata 解析失敗 → 移入 _review")
             stats["parse_failed"] += 1
@@ -337,7 +415,8 @@ def run():
                 raw_title = f"{meta['series']}{idx_str} - {meta['title']}"
 
         clean_title = normalize_filename(raw_title)
-        new_name = build_filename(clean_title, clean_author, ".epub")
+        ext = ".pdf" if kind == "pdf" else ".epub"
+        new_name = build_filename(clean_title, clean_author, ext)
 
         # 重複檢查
         is_dup = is_duplicate(all_data, clean_title, clean_author)
@@ -355,6 +434,14 @@ def run():
         # 寫表（非重複才寫）
         if not is_dup:
             url = f.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+            # PDF：當場 render 封面（cover_drive 只認 mime=application/pdf；新檔走完一次就齊全）
+            cover_formula = None
+            if kind == "pdf":
+                cover_formula = render_and_upload_pdf_cover(drive_service, file_bytes, clean_title)
+                if cover_formula:
+                    stats["pdf_cover_rendered"] += 1
+                else:
+                    stats["pdf_cover_failed"] += 1
             try:
                 current_last_row = append_to_all(sheets_service, sid, current_last_row, {
                     "title": clean_title,
@@ -362,6 +449,7 @@ def run():
                     "lang": meta["lang"],
                     "url": url,
                     "file_id": file_id,
+                    "cover_formula": cover_formula,
                 })
                 # 加進 all_data 避免下一個 epub 重複比對
                 all_data.append([clean_title, clean_author])

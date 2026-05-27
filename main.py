@@ -148,10 +148,18 @@ def register_schedules():
         os.environ.get("COVER_WEB_AT_UTC", "18:00")
     ).do(job_cover_web)
 
-    # ⚠️ 以下 3 個 task 已搬回主帳號 GAS（2026-05-21 對焦後決策）：
-    #   auto_fill_links / health_dashboard / inbox_processor
+    # ⚠️ 以下 2 個 task 已搬回主帳號 GAS（2026-05-21 對焦後決策）：
+    #   auto_fill_links / health_dashboard
     # 理由：純 Sheets / 0 UrlFetch、Zeabur 沒比較好。程式碼留作備援、不註冊 schedule。
     # 對應 GAS：restoreHealthyTriggers.js → restoreHealthyLibraryTriggers()
+    #
+    # 註：inbox_processor 於 2026-05-27 重新啟用、但只跑 PDF 分流：
+    #   - GAS Library/inboxProcessor.js 16:00 TW 跑 epub
+    #   - Python 16:30 TW 跑 pdf（PyMuPDF metadata + 封面渲染、GAS 做不到）
+    # 兩端各自副檔名 filter、不會重複處理。
+    schedule.every().day.at(
+        os.environ.get("INBOX_PROCESSOR_AT_UTC", "08:30")  # 08:30 UTC = 16:30 TW
+    ).do(job_inbox_processor)
 
     # folder_sync：每日 04:00 UTC = 每日 12:00 TW（Phase 3）
     schedule.every().day.at(
@@ -199,7 +207,8 @@ def main():
         logger.info("RUN_ON_START=true，立即跑一次所有 task")
         job_cover_drive()
         job_cover_web()
-        # auto_fill_links / health_dashboard / inbox_processor 已搬回主帳號 GAS、Zeabur 不跑
+        # auto_fill_links / health_dashboard 已搬回主帳號 GAS、Zeabur 不跑
+        job_inbox_processor()  # 2026-05-27 重啟、只跑 PDF
         job_folder_sync()
         job_drive_index()
         job_picture_books()
