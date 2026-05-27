@@ -87,6 +87,18 @@ def mark_drive_gone(sheets_service, row_num: int, dry_run: bool = False):
     ).execute()
 
 
+def mark_marker(sheets_service, row_num: int, marker: str, dry_run: bool = False):
+    """T 欄寫任意 marker 字串（PDF_TOO_BIG / COVER_LOCKED 等）。dry_run 不寫。"""
+    if dry_run:
+        return
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=sheet_id(),
+        range=f"'ALL'!T{row_num}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [[marker]]},
+    ).execute()
+
+
 def clear_cell(sheets_service, range_a1: str, dry_run: bool = False):
     """清掉某個 cell（例如 marker = NO_COVER 找到網路封面後清掉）。"""
     if dry_run:

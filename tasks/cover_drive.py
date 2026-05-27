@@ -29,7 +29,7 @@ from utils.oauth import load_user_creds
 from utils.sheets import (
     COL_TITLE, COL_SOURCE, COL_COVER, COL_MARKER, COL_DRIVE_LINK,
     extract_file_id, classify_cover,
-    read_all_rows, write_q_and_source, mark_drive_gone,
+    read_all_rows, write_q_and_source, mark_drive_gone, mark_marker,
 )
 from utils.drive import (
     get_metadata, download_media, upload_cover, safe_name,
@@ -129,7 +129,7 @@ def find_targets(sheets_service):
         if not title:
             continue
         marker = str(row[COL_MARKER]).strip()
-        if marker in ("DRIVE_GONE", "NO_COVER"):
+        if marker in ("DRIVE_GONE", "NO_COVER", "PDF_TOO_BIG", "COVER_LOCKED"):
             continue
         fid = extract_file_id(str(row[COL_DRIVE_LINK]))
         if not fid:
@@ -163,15 +163,22 @@ def process_one(drive_service, sheets_service, row_num, fid, title, dry_run):
     formula = None
     cover_class = None
 
+    # PDF 上限可由 env PDF_MAX_MB 調整（預設 500MB，舊版 200MB 太緊讓 McGraw-Hill 教材掃描檔全漏掉）
+    pdf_max_bytes = int(os.environ.get("PDF_MAX_MB", "500")) * 1024 * 1024
+    epub_max_bytes = int(os.environ.get("EPUB_MAX_MB", "100")) * 1024 * 1024
+
     try:
-        if mime == "application/pdf" and size <= 200 * 1024 * 1024:
+        if mime == "application/pdf" and size <= pdf_max_bytes:
             pdf_bytes = download_media(drive_service, fid)
             png = render_pdf_first_page(pdf_bytes)
             if png:
                 cover_id = upload_cover(drive_service, safe_name(title) + ".png", png, "image/png")
                 formula = image_formula_for_drive_file(cover_id)
                 cover_class = "pdf_rendered"
-        elif mime == "application/epub+zip" and size <= 100 * 1024 * 1024:
+        elif mime == "application/pdf" and size > pdf_max_bytes:
+            # 超過 cap，無法本機渲染；下方會嘗試 thumbnailLink，若也沒有則標 PDF_TOO_BIG 等人工處理
+            pass
+        elif mime == "application/epub+zip" and size <= epub_max_bytes:
             epub_bytes = download_media(drive_service, fid)
             img_bytes, ext = extract_epub_cover(epub_bytes)
             if img_bytes:
@@ -196,6 +203,13 @@ def process_one(drive_service, sheets_service, row_num, fid, title, dry_run):
             return (None, "process_exception")
 
     if not formula:
+        # PDF 超過 cap 且 Drive 也沒給 thumbnailLink → 標 PDF_TOO_BIG 等使用者透過「修改封面」處理
+        if mime == "application/pdf" and size > pdf_max_bytes:
+            try:
+                mark_marker(sheets_service, row_num, "PDF_TOO_BIG", dry_run=dry_run)
+            except HttpError:
+                pass
+            return ("pdf_too_big", None)
         return ("no_formula", None)
 
     try:
