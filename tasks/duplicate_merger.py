@@ -39,6 +39,7 @@ logger = logging.getLogger("library_cover_updater.duplicate_merger")
 
 MAIN_SHEET = "ALL"
 AUDIT_SHEET = "_MergeAuditLog"
+BACKUP_SHEET = "_MergeDeletedRows_Backup"
 SAFETY_CELL = f"'{AUDIT_SHEET}'!Z1"
 
 # 對應 sheetConfig.js MERGE_INDICES (0-based) = [1,2,3,4,5,6,7]，NOTE_INDEX=8
@@ -112,6 +113,21 @@ def merge_one_group(sheets_service, sid, all_sheet_id, dup_group, dry_run=True):
         body={"values": [merged_data]},
     ).execute()
 
+    # 治本防呆：刪重複列前，把被刪整列完整內容備份到 _MergeDeletedRows_Backup
+    #（過去只記列號到 _MergeAuditLog、合併刪錯救不回；比照 GAS duplicateMergeService.js 同分頁）。
+    # 備份失敗會 raise → merge_one_group 例外 → 本組不執行 delete（fail-safe：沒備份就不刪）。
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    backup_rows = []
+    for row_num, data in items[1:]:
+        title = str(data[0]) if data else ""
+        backup_rows.append([now_str, row_num, primary_row, title] + list(data))
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=sid,
+        range=f"'{BACKUP_SHEET}'!A1",
+        valueInputOption="RAW",
+        body={"values": backup_rows},
+    ).execute()
+
     # delete other rows（從大 row_number 開始刪、避免 index shift）
     rows_to_delete = sorted([r[0] for r in items[1:]], reverse=True)
     delete_requests = [
@@ -177,6 +193,9 @@ def run():
     batch_size = int(os.environ.get("MERGE_BATCH_SIZE", "30"))
     max_daily = int(os.environ.get("SCAN_MAX_DAILY_ATTEMPTS", "5"))
     max_no_progress = int(os.environ.get("SCAN_MAX_NO_PROGRESS_STREAK", "3"))
+    # sanity gate：單次合併刪除筆數佔全表比例 / 絕對值異常高就中止（防大量誤刪，尤其 FORCE_MERGE 路徑）
+    max_delete_ratio = float(os.environ.get("MERGE_MAX_DELETE_RATIO", "0.30"))
+    max_delete_abs = int(os.environ.get("MERGE_MAX_DELETE_ABS", "100"))
 
     creds = load_user_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
@@ -184,6 +203,8 @@ def run():
 
     # 確保 audit sheet 存在（讀 safety state 前要先確保）
     ensure_sheet(sheets_service, sid, AUDIT_SHEET)
+    # 確保刪除備份分頁存在（merge_one_group 刪前 append 整列）
+    ensure_sheet(sheets_service, sid, BACKUP_SHEET)
 
     # ── 安全閘 ──
     today = time.strftime("%Y-%m-%d")
@@ -231,6 +252,35 @@ def run():
     # sort by max row_number desc（從尾部開始合併、刪除 index 不會 shift 影響前面）
     auto_groups.sort(key=lambda g: max(g["row_numbers"]), reverse=True)
     batch = auto_groups[:batch_size]
+
+    # ── sanity gate：本批計畫刪除筆數異常高就中止 ──
+    # 防 detector 因索引/資料異常炸出超量合併組（尤其 FORCE_MERGE 把 manual_review 也納入時）造成大量誤刪。
+    # 只在真的會刪（live_merge）時擋；dry_run 不擋。
+    planned_deletions = sum(len(g["row_numbers"]) - 1 for g in batch)
+    total_rows = len(all_data)
+    delete_ratio = (planned_deletions / total_rows) if total_rows else 0.0
+    if live_merge and (delete_ratio > max_delete_ratio or planned_deletions > max_delete_abs):
+        force_tag = " FORCE_MERGE" if force_merge else ""
+        msg = (
+            f"⚠️ Library merger sanity gate 中止[LIVE{force_tag}]：本批計畫刪除 {planned_deletions} 筆"
+            f"（佔全表 {total_rows} 筆的 {delete_ratio:.0%}），超過門檻"
+            f"（ratio>{max_delete_ratio:.0%} 或絕對值>{max_delete_abs}）。\n"
+            f"待合併組數 {len(batch)}（auto {len(auto_groups)}）。\n"
+            f"未執行任何合併/刪除。請先 review _DupCandidates／detector 是否異常，"
+            f"確認無誤再調高 MERGE_MAX_DELETE_RATIO / MERGE_MAX_DELETE_ABS 或分批 MERGE_BATCH_SIZE 重跑。"
+        )
+        logger.warning(f"[duplicate_merger] {msg}")
+        notify_error(msg)
+        _write_safety_state(sheets_service, sid, state)
+        return {
+            "task": "duplicate_merger",
+            "targets": 0,
+            "note": "sanity_gate_abort",
+            "planned_deletions": planned_deletions,
+            "total_rows": total_rows,
+            "delete_ratio": round(delete_ratio, 4),
+            "stats": dict(state),
+        }
 
     # 確保 ALL sheet id
     all_sheet_id = get_all_sheet_id(sheets_service, sid)
