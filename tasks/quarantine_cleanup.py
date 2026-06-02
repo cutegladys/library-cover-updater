@@ -117,12 +117,14 @@ def run():
     # ── 評估：md5+size+ext 三重相同、size>=MIN_SIZE、非空md5、且(可選)年齡達標 ──
     now = datetime.now(timezone.utc)
     deletable = []
+    tier2 = 0  # 有 md5 的真書、但無 byte 完全相同母本 → 需人工/AI 判斷(同書不同格式/版本 or 唯一份)
     for f in quar:
         md5, size = f["md5"], f["size"]
         if not md5 or md5 == EMPTY_MD5 or size < MIN_SIZE:
             continue
         twin = living.get((md5, size, _ext(f["name"])))
         if not twin:
+            tier2 += 1
             continue
         if min_age_days > 0 and f["mtime"]:
             try:
@@ -149,6 +151,7 @@ def run():
         "隔離檔": len(quar),
         "確定可丟(byte相同)": len(deletable),
         "可丟容量MB": total_mb,
+        "Tier2待人工審視": tier2,
     }
     if apply:
         stats["已丟垃圾桶"] = trashed
