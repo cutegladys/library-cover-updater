@@ -4,3 +4,6 @@ __pycache__/
 .env.local
 *.log
 .DS_Store
+
+# 一次性稽核腳本（2026-06-02 DRIVE_GONE 全量驗證）
+scripts/verify_drive_gone_full.py
