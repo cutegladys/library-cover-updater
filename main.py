@@ -123,6 +123,11 @@ def job_duplicate_merger():
     _run_task("duplicate_merger", duplicate_merger.run)
 
 
+def job_quarantine_cleanup():
+    from tasks import quarantine_cleanup
+    _run_task("quarantine_cleanup", quarantine_cleanup.run)
+
+
 def job_merge_queue_poller():
     """D2 bridge — 不用 _run_task wrapper（成功也不發通知；merge_queue_poller 自己控制）。"""
     try:
@@ -195,6 +200,13 @@ def register_schedules():
 
     # duplicate_merger：不自動排程；由 merge_queue_poller 透過 D2 bridge 觸發、
     # 或 LIVE_MERGE=true + RUN_ON_START=true Redeploy 手動觸發。
+
+    # quarantine_cleanup：週日 20:00 UTC = 週一 04:00 TW（cover_web 18:00 後，錯開）
+    # 只清「md5+size+ext 與非隔離存活檔完全相同」且進隔離 >MIN_AGE_DAYS 天的，丟垃圾桶可救回。
+    # 預設 QUARANTINE_CLEANUP_APPLY=false（只報告）；確認首週報告無誤後設 true 才真清。
+    schedule.every().sunday.at(
+        os.environ.get("QUARANTINE_CLEANUP_AT_UTC", "20:00")
+    ).do(job_quarantine_cleanup)
 
 
 def main():

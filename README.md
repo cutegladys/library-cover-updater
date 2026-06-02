@@ -41,6 +41,17 @@ Library 試算表新書封面自動補圖（Zeabur 排程，獨立容器）。
 | `LIBRARY_COVER_UPDATER_AT_UTC` | `18:00` | 週六 18:00 UTC = 週日 02:00 TW |
 | `COVER_UPDATER_DRY_RUN` | `0` | 1 = 只印不寫（除錯） |
 | `RUN_ON_START` | `false` | 1 = 容器啟動立即跑一次（部署驗證用） |
+| `QUARANTINE_CLEANUP_APPLY` | `false` | `true` = 隔離區安全清理真的丟垃圾桶；其餘 = 只報告(dry-run) |
+| `QUARANTINE_CLEANUP_MIN_AGE_DAYS` | `30` | 只清進隔離早於 N 天的檔（額外安全緩衝） |
+| `QUARANTINE_CLEANUP_AT_UTC` | `20:00` | 週日 20:00 UTC = 週一 04:00 TW |
+
+> **quarantine_cleanup task**（2026-06 新增）：每週掃兩個書庫 root，找隔離資料夾
+> (`_duplicates_quarantine`/`_archive_originals`/`_from_`/`_conflict`/`_manual_review`)
+> 底下「md5+size+副檔名 三重與某個非隔離存活檔完全相同」的真重複，丟垃圾桶(30 天可救回)。
+> 只碰 byte 完全相同的（同一份東西書庫別處還有），零誤刪風險。**預設 dry-run**；
+> 確認首週 Telegram 報告無誤後，把 `QUARANTINE_CLEANUP_APPLY` 設 `true` 才真清。
+> 本機等效腳本：`Library/scripts/quarantine_safe_cleanup.py`。
+> Tier 2（同書不同格式/版本、byte 不同的）不在此 task 範圍，由人工/AI 定期審視。
 
 ## Zeabur 部署 SOP
 
