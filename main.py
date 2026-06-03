@@ -57,7 +57,12 @@ def _run_task(task_name: str, task_module_run):
             lines = [
                 f"✅ [{task_name}] 完成（targets={result.get('targets',0)}, elapsed={result.get('elapsed_sec',0)}s）",
             ]
-            for k, v in sorted(stats.items(), key=lambda x: -x[1]):
+            # stats 值不保證是數字（早退路徑會回 dict(state)，含 date / last_succeeded 等字串）；
+            # 數字降冪排前、非數字維持插入序排後，避免對字串做 unary minus 炸掉整個成功訊息。
+            def _stat_sort_key(item):
+                v = item[1]
+                return (0, -v) if isinstance(v, (int, float)) else (1, 0)
+            for k, v in sorted(stats.items(), key=_stat_sort_key):
                 lines.append(f"  {k}: {v}")
             msg = "\n".join(lines)
         logger.info(msg)
