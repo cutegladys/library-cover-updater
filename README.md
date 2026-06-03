@@ -68,7 +68,9 @@ Library 試算表新書封面自動補圖（Zeabur 排程，獨立容器）。
 
 ## 維護
 
-- **OAuth refresh token 失效（約每 7 天，`invalid_grant: Token has been expired or revoked`）**：本服務的 Desktop OAuth client 掛在標準專案 `linecalendarbot-475101`，該專案 OAuth 同意畫面在 **Testing 模式** → refresh token 每 7 天到期被 revoke（**不是**「半年-1 年的安全撤銷」；背景見根倉 memory `gas_default_vs_standard_gcp_project_restricted_scope` 與計畫書 `claudeapi-gmail-restricted-scope-fix-2026-05-31.plan.md`）。收到 Telegram「merge_queue_poller 異常：invalid_grant」時的 3 步復原（**全程 CLI，不必開 Zeabur 面板**）：
+> ⚠ **2026-06-03 已遷移 SA + relay 混合身分**（commit `10f4ff6`，根治每週 OAuth 重簽）。現行：讀走 Service Account `n8n-178@`（env `GOOGLE_SA_JSON`，base64；`USE_SA_CREDS=1`）、寫走 MarukoRestrictedRelay（env `RELAY_TOKEN`）。**下面的 OAuth 重簽流程已降為 rollback only**（設 `USE_SA_CREDS` 非 1 才會用到 user-OAuth 讀路徑）。完整紀錄與 Step 6 收尾待辦見 `docs/plans/2026-06-03-sa-relay-migration.plan.md`。Step 6（移除 user-OAuth 死碼、整段改寫本維護段）約 2026-06-10 後做。
+
+- **[rollback only] OAuth refresh token 失效（約每 7 天，`invalid_grant: Token has been expired or revoked`）**：本服務的 Desktop OAuth client 掛在標準專案 `linecalendarbot-475101`，該專案 OAuth 同意畫面在 **Testing 模式** → refresh token 每 7 天到期被 revoke（**不是**「半年-1 年的安全撤銷」；背景見根倉 memory `gas_default_vs_standard_gcp_project_restricted_scope` 與計畫書 `claudeapi-gmail-restricted-scope-fix-2026-05-31.plan.md`）。收到 Telegram「merge_queue_poller 異常：invalid_grant」時的 3 步復原（**全程 CLI，不必開 Zeabur 面板**）：
   1. 本機重跑 `Library/scripts/auth_setup.py`（會開瀏覽器，**選主帳號 `cutegladys0708`** 同意，restricted 警告畫面按「進階→繼續」）→ 寫新 token 到 `憑證/library-cover-user-token.json`
   2. 重新 minify 副本（不必重 OAuth，只要 full json 還活著）：
      ```python

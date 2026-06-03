@@ -1,7 +1,7 @@
 ---
 title: library-cover-updater 改 SA + relay 混合身分（根治每週重簽）
 type: 改善/重構
-status: 待執行
+status: 進行中（Step 1-5 完成並上線驗證；Step 6 收尾待穩定約一週 ~2026-06-10）
 created: 2026-06-03
 owner: Gladys
 todos:
@@ -107,3 +107,31 @@ todos:
 - **SA 列不到某些書檔**：因資料夾沒分享到 → Step 4 清單要完整；drive_index 跑出來「少一批」時先查資料夾分享。
 - **relay 呼叫量**：inbox_processor/merger 搬檔變多次 HTTP（小 payload），注意別撞 GAS 每日 UrlFetch 配額；量小（週跑、各數十筆）應無虞，但收尾時看 RelayLog 確認。
 - **SA 金鑰外洩風險**：`GOOGLE_SA_JSON` 只放 Zeabur Variables，不入 git（`.env` 已 gitignore）。
+
+---
+
+## 已執行紀錄（2026-06-03，Step 1-5 完成上線）
+
+**選定 SA**：`n8n-178@linecalendarbot-475101.iam.gserviceaccount.com`（金鑰來源本機 `N8N\雲端藥品\credentials.json`）。Step 0 確認：遷移前 Library sheet 只分享給 owner、無任何 SA。
+
+**relay（commit 在根倉 MarukoRestrictedRelay）**：新增 `drive.upload` / `drive.move`（含 `newName` 改名）/ `drive.create_folder`（idempotent）；`drive.trash` 沿用既有。`RELAY_VERSION=2026-06-03.2`、`deploy -i @4`、四端點 live 煙測通過。
+
+**lcu（commit `10f4ff6`）**：
+- `utils/relay.py`：`relay_call()`（requests POST，URL 內建常數可被 env `RELAY_URL` 覆寫，token 讀 `RELAY_TOKEN`）。
+- `utils/oauth.py`：`load_sa_creds()`（`GOOGLE_SA_JSON` 接受**原始 JSON 或 base64**；Zeabur CLI `-k` 的 CSV parser 對原始 JSON 會炸，故實際存 base64）。`load_creds()` **過渡期 fail-safe 預設仍 user-OAuth**，`USE_SA_CREDS=1` 才切 SA。
+- 寫操作改 relay：`utils/drive.py upload_cover`、`inbox_processor`（folder create / move+rename / 兩處搬 _review）、`quarantine_cleanup`（trash）。
+- 全 13 task `build()` 改 `load_creds()`。
+- **計畫修正**：`duplicate_merger` 其實**無 Drive 搬隔離**（純 Sheets row-merge + `_MergeDeletedRows_Backup` 分頁），只換 creds、不需 relay。
+- `main.py _run_task` 對字串 stats 做 unary minus 的既有 bug 由 user 平行修掉（commit `f42e603`，在 `10f4ff6` 之上）。
+
+**Zeabur（service `6a0dd12733d1a635fa380313`）變數**：新增 `RELAY_TOKEN`（=CLAUDE_API_TOKEN）、`GOOGLE_SA_JSON`（base64）、`USE_SA_CREDS=1`；保留 `GOOGLE_USER_TOKEN_JSON`（rollback）。
+
+**驗證**：先以 `n8n-178` 金鑰本機直測 → SA 讀 sheet(21 分頁)+兩根夾、`canEdit=true`。再上 `f42e603` 部署跑 RUN_ON_START DRY → `cover_drive` `pdf_rendered=14/epub_extracted=6`（**SA 下載 + relay 上傳封面 in-container 成功**）、無 invalid_grant/403。切回 steady state（`RUN_ON_START=false`、`DRY_RUN=false`、`USE_SA_CREDS=1`）後 restart，`merge_queue_poller` 06:52 SA 讀 `_MergeQueue` clean。
+
+**rollback**：Zeabur 移除/設 `USE_SA_CREDS` 非 1 → 立即切回舊 user-OAuth 讀路徑（寫仍走 relay，需 `RELAY_TOKEN`）。`GOOGLE_USER_TOKEN_JSON` 保留至 Step 6。
+
+**Step 6 待辦（穩定約一週 ~2026-06-10）**：移除 `load_user_creds` + `GOOGLE_USER_TOKEN_JSON` + `USE_SA_CREDS` 開關（預設改 SA）；README 維護段整段改寫（OAuth 重簽流程拔掉、改 SA+relay 架構＋SA 金鑰怎麼換）；memory `project_library_cover_updater_token_weekly_testing_expiry` 標記已根治。
+
+**已知小副作用**：DRY_RUN 下 `cover_drive` 仍會上傳封面（只略過寫 sheet，既有行為），故 RUN_ON_START 測試在 Cover Art 留下少量未連結的孤兒封面 PNG（無害、下次真跑會建正式的）。
+
+**安全 follow-up**：遷移過程 Zeabur CLI 報錯把 n8n-178 私鑰印進 session 記錄（本機、.jsonl 不同步、風險低），穩定後建議輪替 n8n-178 金鑰（同步換 n8n credential + 此 `GOOGLE_SA_JSON`）。
