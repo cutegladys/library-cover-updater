@@ -68,7 +68,22 @@ Library 試算表新書封面自動補圖（Zeabur 排程，獨立容器）。
 
 ## 維護
 
-- **OAuth refresh token 失效**：Google 偶因安全偵測撤銷（半年-1 年一次）。收到 Telegram「❌ Library 封面修補失敗：invalid_grant」→ 本機重跑 `Library/scripts/auth_setup.py` → 更新 Zeabur 的 `GOOGLE_USER_TOKEN_JSON`
+- **OAuth refresh token 失效（約每 7 天，`invalid_grant: Token has been expired or revoked`）**：本服務的 Desktop OAuth client 掛在標準專案 `linecalendarbot-475101`，該專案 OAuth 同意畫面在 **Testing 模式** → refresh token 每 7 天到期被 revoke（**不是**「半年-1 年的安全撤銷」；背景見根倉 memory `gas_default_vs_standard_gcp_project_restricted_scope` 與計畫書 `claudeapi-gmail-restricted-scope-fix-2026-05-31.plan.md`）。收到 Telegram「merge_queue_poller 異常：invalid_grant」時的 3 步復原（**全程 CLI，不必開 Zeabur 面板**）：
+  1. 本機重跑 `Library/scripts/auth_setup.py`（會開瀏覽器，**選主帳號 `cutegladys0708`** 同意，restricted 警告畫面按「進階→繼續」）→ 寫新 token 到 `憑證/library-cover-user-token.json`
+  2. 重新 minify 副本（不必重 OAuth，只要 full json 還活著）：
+     ```python
+     import json
+     i=json.load(open(r'E:\Dropbox\MarukoAutomation\憑證\library-cover-user-token.json',encoding='utf-8'))
+     open(r'E:\Dropbox\MarukoAutomation\憑證\zeabur-handover\google_user_token.minified.txt','w',encoding='utf-8',newline='').write(json.dumps(i,separators=(',',':'),ensure_ascii=False))
+     ```
+  3. 推進 Zeabur 並重啟（service id `6a0dd12733d1a635fa380313`；`variable update -k` 對含逗號的長 JSON 實測可完整存入，2026-06-03 驗證）：
+     ```bash
+     VAL=$(cat 憑證/zeabur-handover/google_user_token.minified.txt)
+     npx zeabur@latest variable update --id 6a0dd12733d1a635fa380313 -k "GOOGLE_USER_TOKEN_JSON=$VAL" -y -i=false
+     npx zeabur@latest service restart --id 6a0dd12733d1a635fa380313 -y
+     ```
+     重啟後等下一次 5 分鐘 poll，log 出現 `[merge_queue_poller] queue status: ... (skip)` 無 `invalid_grant` 即復原。
+  > ⚠ **不要為了省這週期把 `linecalendarbot-475101` 改成 Production**——會重新觸發 restricted Drive scope 的未驗證 runtime 牆（2026-05-31 relay 搬遷就是為了避開它）。Python/Zeabur 用 Desktop OAuth **無法**像 GAS 那樣靠免驗證預設專案規避（那是 GAS 專屬機制），走 relay 又會撞 30MB/6 分鐘上限，只能接受每週重簽 + Telegram 監看。
 - **新書節奏改變**：若一週超過 200 本，調大 `MAX_ROWS_PER_RUN`，或改成週跑兩次
 - **每週一固定看一次 Telegram 通知**：確認週末有跑
 
