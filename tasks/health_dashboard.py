@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.notify import notify
 from utils.sheets import sheet_id
 
@@ -466,7 +466,7 @@ def apply_formatting(sheets_service, spreadsheet_id, sheet_id, content, statuses
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 

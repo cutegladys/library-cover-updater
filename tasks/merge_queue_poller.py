@@ -20,7 +20,7 @@ import time
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 from utils.notify import notify, notify_error
 
@@ -118,7 +118,7 @@ def write_queue_status(sheets_service, sid, status: str):
 
 
 def run():
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 

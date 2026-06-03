@@ -32,7 +32,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 
 logger = logging.getLogger("library_cover_updater.picture_books")
@@ -185,7 +185,7 @@ def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
     parse_epub = os.environ.get("PB_PARSE_EPUB_META", "").lower() in ("1", "true", "yes")
 
-    creds = load_user_creds()
+    creds = load_creds()
     drive_service = build("drive", "v3", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()

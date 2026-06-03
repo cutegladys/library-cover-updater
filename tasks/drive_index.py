@@ -28,7 +28,7 @@ from collections import Counter
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 
 logger = logging.getLogger("library_cover_updater.drive_index")
@@ -107,7 +107,7 @@ def run():
     roots_env = os.environ.get("DRIVE_INDEX_ROOT_IDS", "").strip()
     root_ids = [s.strip() for s in roots_env.split(",") if s.strip()] if roots_env else DEFAULT_ROOT_IDS
 
-    creds = load_user_creds()
+    creds = load_creds()
     drive_service = build("drive", "v3", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()

@@ -30,7 +30,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
+from utils.relay import relay_call
 from utils.sheets import sheet_id
 from utils.normalizer import normalize_filename, normalize_author, build_filename
 from utils.drive import upload_cover, safe_name, image_formula_for_drive_file
@@ -70,20 +71,12 @@ def find_subfolder(drive_service, parent_id: str, name: str):
 
 
 def get_or_create_subfolder(drive_service, parent_id: str, name: str) -> str:
-    """找 parent 下指定名稱的子資料夾、找不到就建。回 fileId。"""
+    """找 parent 下指定名稱的子資料夾、找不到就建（建夾走 relay，SA 不能建）。回 fileId。"""
     fid = find_subfolder(drive_service, parent_id, name)
     if fid:
         return fid
-    r = drive_service.files().create(
-        body={
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        },
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
-    return r["id"]
+    res = relay_call("drive.create_folder", {"parentId": parent_id, "name": name})
+    return res["folderId"]
 
 
 def list_books_in_folder(drive_service, folder_id: str):
@@ -298,21 +291,20 @@ def append_to_all(sheets_service, sid: str, last_row: int, info: dict):
 
 
 def move_file_to_folder(drive_service, file_id: str, new_parent_id: str, old_parent_id: str, new_name: str):
-    """改名 + 從 _inbox 搬到 eBookReading 根目錄。"""
-    drive_service.files().update(
-        fileId=file_id,
-        addParents=new_parent_id,
-        removeParents=old_parent_id,
-        body={"name": new_name},
-        supportsAllDrives=True,
-    ).execute()
+    """改名 + 從 _inbox 搬到 eBookReading 根目錄（搬檔+改名走 relay，SA 不能搬 owner 的檔）。"""
+    relay_call("drive.move", {
+        "fileId": file_id,
+        "addParent": new_parent_id,
+        "removeParent": old_parent_id,
+        "newName": new_name,
+    })
 
 
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
     limit = int(os.environ.get("INBOX_PROCESS_LIMIT", "50"))
 
-    creds = load_user_creds()
+    creds = load_creds()
     drive_service = build("drive", "v3", credentials=creds)
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
@@ -372,14 +364,13 @@ def run():
                 stats["pdf_truncated"] += 1
                 if not dry_run and review_id:
                     try:
-                        drive_service.files().update(
-                            fileId=file_id,
-                            addParents=review_id,
-                            removeParents=inbox_id,
-                            supportsAllDrives=True,
-                        ).execute()
+                        relay_call("drive.move", {
+                            "fileId": file_id,
+                            "addParent": review_id,
+                            "removeParent": inbox_id,
+                        })
                         stats["moved_to_review"] += 1
-                    except HttpError as e:
+                    except Exception as e:
                         logger.warning(f"  搬到 _review err: {e}")
                         stats["move_review_err"] += 1
                 continue
@@ -391,14 +382,13 @@ def run():
             stats["parse_failed"] += 1
             if not dry_run and review_id:
                 try:
-                    drive_service.files().update(
-                        fileId=file_id,
-                        addParents=review_id,
-                        removeParents=inbox_id,
-                        supportsAllDrives=True,
-                    ).execute()
+                    relay_call("drive.move", {
+                        "fileId": file_id,
+                        "addParent": review_id,
+                        "removeParent": inbox_id,
+                    })
                     stats["moved_to_review"] += 1
-                except HttpError as e:
+                except Exception as e:
                     logger.warning(f"  搬到 _review err: {e}")
                     stats["move_review_err"] += 1
             continue
@@ -489,11 +479,11 @@ def run():
                 stats["write_err"] += 1
                 continue
 
-        # 搬檔
+        # 搬檔（走 relay，失敗為 RuntimeError 非 HttpError → 廣捕）
         try:
             move_file_to_folder(drive_service, file_id, EBOOK_ROOT_ID, inbox_id, new_name)
             stats["moved"] += 1
-        except HttpError as e:
+        except Exception as e:
             logger.warning(f"  搬檔 err: {e}")
             stats["move_err"] += 1
 

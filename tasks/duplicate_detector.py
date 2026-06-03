@@ -22,7 +22,7 @@ from collections import Counter, defaultdict
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 from utils.notify import notify_error, notify_with_buttons
 
@@ -154,7 +154,7 @@ def scan_duplicate_groups(all_data):
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 

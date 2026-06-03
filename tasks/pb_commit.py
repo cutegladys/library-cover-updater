@@ -23,7 +23,7 @@ from collections import Counter
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 
 logger = logging.getLogger("library_cover_updater.pb_commit")
@@ -48,7 +48,7 @@ STATUS_VALUE = "已擁有"
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 

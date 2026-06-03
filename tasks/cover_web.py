@@ -26,7 +26,7 @@ import requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import (
     COL_TITLE, COL_COVER, COL_MARKER, COL_DRIVE_LINK,
     extract_file_id, classify_cover,
@@ -177,7 +177,7 @@ def run():
     rate_hz = float(os.environ.get("WEB_SEARCH_RATE_HZ", "5"))
     sleep_per = max(0.0, 1.0 / max(rate_hz, 0.1))
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
 
     logger.info("[cover_web] Loading Library sheet...")

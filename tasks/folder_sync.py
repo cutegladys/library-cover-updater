@@ -33,7 +33,7 @@ from collections import Counter
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.notify import notify_error
 from utils.sheets import (
     COL_TITLE, COL_SOURCE, COL_MARKER, COL_DRIVE_LINK,
@@ -80,7 +80,7 @@ def run():
     retry_times = int(os.environ.get("FOLDER_SYNC_RETRY_TIMES", "2"))
     retry_delay = float(os.environ.get("FOLDER_SYNC_RETRY_DELAY", "1.5"))
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     drive_service = build("drive", "v3", credentials=creds)
     sid = sheet_id()

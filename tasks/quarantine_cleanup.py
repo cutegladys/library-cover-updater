@@ -31,7 +31,8 @@ from datetime import datetime, timezone
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
+from utils.relay import relay_call
 
 logger = logging.getLogger("library_cover_updater.quarantine_cleanup")
 
@@ -61,7 +62,7 @@ def run():
     apply = (os.environ.get("QUARANTINE_CLEANUP_APPLY", "false").lower() in ("1", "true", "yes")) and not global_dry
     min_age_days = int(os.environ.get("QUARANTINE_CLEANUP_MIN_AGE_DAYS", "30"))
 
-    creds = load_user_creds()
+    creds = load_creds()
     drive = build("drive", "v3", credentials=creds)
 
     # ── 遞迴 bulk 掃，帶 md5；in_quar 標記是否在隔離路徑下 ──
@@ -140,7 +141,7 @@ def run():
     if apply:
         for f in deletable:
             try:
-                drive.files().update(fileId=f["fid"], body={"trashed": True}, supportsAllDrives=True).execute()
+                relay_call("drive.trash", {"fileId": f["fid"]})
                 trashed += 1
             except Exception as e:
                 failed += 1

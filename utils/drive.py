@@ -1,10 +1,6 @@
-"""共用 Drive 操作：下載檔案、上傳封面、權限設定。"""
-import io
+"""共用 Drive 操作：下載檔案、上傳封面（經 relay）、檔名安全化、IMAGE 公式。"""
 import os
 import re
-
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload
 
 
 _safe_re = re.compile(r"[^\w\-. ]+", re.UNICODE)
@@ -36,24 +32,24 @@ def download_media(drive_service, file_id: str) -> bytes:
 
 
 def upload_cover(drive_service, name: str, content_bytes: bytes, mime: str) -> str:
-    """上傳封面到 Cover Art 資料夾 + 設 anyone-with-link viewer。返 fileId。"""
-    media = MediaIoBaseUpload(io.BytesIO(content_bytes), mimetype=mime, resumable=False)
-    f = drive_service.files().create(
-        body={"name": name, "parents": [cover_folder_id()]},
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
-    cover_id = f["id"]
-    try:
-        drive_service.permissions().create(
-            fileId=cover_id,
-            body={"type": "anyone", "role": "reader"},
-            supportsAllDrives=True,
-        ).execute()
-    except HttpError:
-        pass
-    return cover_id
+    """上傳封面到 Cover Art 資料夾 + 設 anyone-with-link viewer。返 fileId。
+
+    經 relay 以 owner 身分建檔（SA 無 My Drive 配額不能建檔；封面仍存在 owner 的
+    Cover Art 夾、擁有者是 owner、與既有封面一致、不改外部 lh3 網址）。
+    `drive_service` 參數保留以維持呼叫端介面相容，實際不再使用。
+    """
+    import base64
+
+    from utils.relay import relay_call
+
+    b64 = base64.b64encode(content_bytes).decode("ascii")
+    res = relay_call("drive.upload", {
+        "folderId": cover_folder_id(),
+        "name": name,
+        "mimeType": mime,
+        "contentBase64": b64,
+    })
+    return res["fileId"]
 
 
 def image_formula_for_drive_file(file_id: str) -> str:

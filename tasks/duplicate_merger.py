@@ -30,7 +30,7 @@ from collections import Counter
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 from utils.notify import notify_error
 from tasks.duplicate_detector import scan_duplicate_groups
@@ -197,7 +197,7 @@ def run():
     max_delete_ratio = float(os.environ.get("MERGE_MAX_DELETE_RATIO", "0.30"))
     max_delete_abs = int(os.environ.get("MERGE_MAX_DELETE_ABS", "100"))
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 

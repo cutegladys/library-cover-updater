@@ -26,7 +26,7 @@ from collections import Counter
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from utils.oauth import load_user_creds
+from utils.oauth import load_creds
 from utils.sheets import sheet_id
 
 logger = logging.getLogger("library_cover_updater.auto_fill_links")
@@ -53,7 +53,7 @@ def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
     batch_size = int(os.environ.get("AUTO_FILL_BATCH_SIZE", "500"))
 
-    creds = load_user_creds()
+    creds = load_creds()
     sheets_service = build("sheets", "v4", credentials=creds)
     sid = sheet_id()
 
