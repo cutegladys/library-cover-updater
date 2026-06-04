@@ -133,15 +133,37 @@ def job_quarantine_cleanup():
     _run_task("quarantine_cleanup", quarantine_cleanup.run)
 
 
+# merge_queue_poller 連續失敗計數：單次網路 blip（read timeout 等）會自癒——
+# poller 每 5 分鐘跑、_MergeQueue A1 旗標維持 pending 直到成功處理，下個週期自動接手。
+# 故依 CLAUDE.md §七 rule 17「只在無法推進時通知」，單次失敗靜默，連續 N 次才發 Telegram。
+_merge_poll_consecutive_failures = 0
+
+
 def job_merge_queue_poller():
-    """D2 bridge — 不用 _run_task wrapper（成功也不發通知；merge_queue_poller 自己控制）。"""
+    """D2 bridge — 不用 _run_task wrapper（成功也不發通知；merge_queue_poller 自己控制）。
+
+    單次失敗（多為短暫網路逾時）不通知——poller 自癒、下個 5 分鐘週期重試。
+    連續 >= MERGE_QUEUE_FAIL_NOTIFY_THRESHOLD 次（預設 3，約 15 分鐘卡死）才發 Telegram。
+    注意：真正的 merge 失敗在 merge_queue_poller.run() 內已自行 notify_error（actionable），
+    這裡只處理「還沒進到處理就掛掉」（creds / build / read timeout）的網路類失敗。
+    """
+    global _merge_poll_consecutive_failures
     try:
         from tasks import merge_queue_poller
         merge_queue_poller.run()
+        _merge_poll_consecutive_failures = 0
     except Exception as e:
-        from utils.notify import notify_error
-        logger.error(f"merge_queue_poller exception: {e}")
-        notify_error(f"❌ merge_queue_poller 異常：{e}")
+        _merge_poll_consecutive_failures += 1
+        n = _merge_poll_consecutive_failures
+        logger.error(f"merge_queue_poller exception (#{n}): {e}")
+        threshold = int(os.environ.get("MERGE_QUEUE_FAIL_NOTIFY_THRESHOLD", "3"))
+        if n >= threshold:
+            from utils.notify import notify_error
+            poll_min = int(os.environ.get("MERGE_QUEUE_POLL_MIN", "5"))
+            notify_error(
+                f"❌ merge_queue_poller 連續 {n} 次異常"
+                f"（約 {n * poll_min} 分鐘無法推進）：{e}"
+            )
 
 
 # ── schedule registration ──────────────────────────────────────
