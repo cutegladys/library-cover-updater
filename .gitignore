@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 .env
 .env.local
-.env.tmp.*
+# atomic-write 殘留 <file>.tmp.<pid>.<hash>（對齊根 .gitignore 慣例）
+*.tmp.[0-9]*.*
 *.log
 .DS_Store
 
