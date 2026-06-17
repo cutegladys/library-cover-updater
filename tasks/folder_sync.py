@@ -36,7 +36,7 @@ from googleapiclient.errors import HttpError
 from utils.oauth import load_creds
 from utils.notify import notify_error
 from utils.sheets import (
-    COL_TITLE, COL_SOURCE, COL_MARKER, COL_DRIVE_LINK,
+    COL_TITLE, COL_SOURCE, COL_NOTE, COL_MARKER, COL_DRIVE_LINK,
     extract_file_id, sheet_id, read_all_rows,
 )
 
@@ -45,9 +45,42 @@ logger = logging.getLogger("library_cover_updater.folder_sync")
 SOURCE_FILTER = "Google Drive"
 EXT_RE = re.compile(r"\.[^.]*$")
 
+# 🛡 分歧守門門檻：新檔名與「現有書名」和「原始檔名」字詞重疊都低於此值 → 視為 Drive 連結錯位、不覆寫
+DIVERGENCE_OVERLAP_THRESHOLD = 0.34
+_ORIG_NAME_RE = re.compile(r"原始檔名[:：]\s*(.+)")
+_WORD_RE = re.compile(r"[^0-9a-z一-鿿]+")
+_ZLIB_RE = re.compile(r"\(z-?library\)", re.I)
+
 
 def strip_ext(name: str) -> str:
     return EXT_RE.sub("", name).strip()
+
+
+def extract_orig_stem(note: str) -> str:
+    """從 I 欄備註抽『原始檔名』stem（去 doubled-note / Drive 註記分隔 + 去副檔名）。"""
+    if not note:
+        return ""
+    m = _ORIG_NAME_RE.search(str(note))
+    if not m:
+        return ""
+    raw = m.group(1).split("；")[0].split(" ; ")[0]
+    return strip_ext(raw)
+
+
+def _word_set(s: str) -> set:
+    if not s:
+        return set()
+    x = _ZLIB_RE.sub(" ", str(s).lower())
+    x = _WORD_RE.sub(" ", x)
+    return {w for w in x.split() if w and not w.isdigit()}
+
+
+def title_overlap(a: str, b: str) -> float:
+    """|a 詞集 ∩ b 詞集| / |a 詞集|（a＝新檔名 為分母）。a 無可比字元時回 1（不誤擋）。"""
+    sa, sb = _word_set(a), _word_set(b)
+    if not sa:
+        return 1.0
+    return len(sa & sb) / len(sa)
 
 
 def fetch_drive_meta_with_retry(drive_service, fid, retry_times: int, retry_delay: float):
@@ -109,7 +142,8 @@ def run():
         fid = extract_file_id(str(row[COL_DRIVE_LINK]))
         if not fid:
             continue
-        candidates.append((idx, fid, title))
+        note_stem = extract_orig_stem(str(row[COL_NOTE]) if len(row) > COL_NOTE else "")
+        candidates.append((idx, fid, title, note_stem))
 
     logger.info(f"[folder_sync] Candidates (Source=Google Drive + has fileId, marker!=DRIVE_GONE): {len(candidates)} (skipped DRIVE_GONE={skipped_drive_gone})")
 
@@ -125,8 +159,9 @@ def run():
     stats = Counter()
     start = time.time()
     inaccessible_fids = []  # list of (row_num, fid, title, status)
+    review_rows = []  # 🛡 分歧守門攔下、未覆寫的疑似錯位 (row_num, old_title, new_name, note_stem, fid)
 
-    for i, (row_num, fid, title) in enumerate(candidates, 1):
+    for i, (row_num, fid, title, note_stem) in enumerate(candidates, 1):
         meta, err_status = fetch_drive_meta_with_retry(drive_service, fid, retry_times, retry_delay)
         if meta is None:
             if err_status == 404:
@@ -156,6 +191,20 @@ def run():
         # 兩種比對方式（對應 GAS 邏輯）：去副檔名 或 原樣
         if current_stripped == title_stripped or current_stripped == title:
             stats["unchanged"] += 1
+            continue
+
+        # 🛡 分歧守門：新檔名若與「現有書名」和「原始檔名」字詞重疊都 < 門檻，
+        #   ＝極可能是 U 欄 Drive 連結錯位（指到別本書）。不覆寫書名，改記 _TitleSyncReview 供人工檢視。
+        #   背景：2026-06-17 發現整段書名被錯位的 Drive 連結默默洗掉（debug-log 2026-06-17）。
+        ov_title = title_overlap(current_stripped, title)
+        ov_note = title_overlap(current_stripped, note_stem) if note_stem else 1.0
+        if ov_title < DIVERGENCE_OVERLAP_THRESHOLD and ov_note < DIVERGENCE_OVERLAP_THRESHOLD:
+            stats["diverged_held"] += 1
+            review_rows.append((row_num, title, current_stripped, note_stem, fid))
+            logger.warning(
+                f"[folder_sync] 🛡 守門攔下 row {row_num}：「{title[:40]}」↛「{current_stripped[:40]}」"
+                f" (overlap title={ov_title:.2f} note={ov_note:.2f}) → _TitleSyncReview"
+            )
             continue
 
         # 需更新：寫回 A 欄為去副檔名後的當前 Drive 名
@@ -199,8 +248,27 @@ def run():
                 logger.warning(f"[folder_sync] batchUpdate err {e.resp.status}: {e}")
     stats["marker_drive_gone_new"] = len(marker_updates)
 
+    # 🛡 把守門攔下的疑似錯位寫進 _TitleSyncReview（append；dry-run 不寫）
+    if review_rows and not dry_run:
+        try:
+            _append_title_sync_review(sheets_service, sid, review_rows)
+        except Exception as e:
+            logger.warning(f"[folder_sync] 寫入 _TitleSyncReview 失敗：{e}")
+
     elapsed = time.time() - start
     logger.info(f"[folder_sync] 完成 elapsed={elapsed:.0f}s stats={dict(stats)}")
+
+    # 🛡 守門攔下通知：書名沒被改、但有疑似 Drive 連結錯位待人工檢視
+    if review_rows:
+        rlines = [f"🛡 folder_sync 分歧守門：攔下 {len(review_rows)} 筆疑似 Drive 連結錯位（書名已保留、未被覆蓋），見 _TitleSyncReview 分頁"]
+        for row_num, old_title, new_name, _ns, _fid in review_rows[:15]:
+            rlines.append(f"  row {row_num} | 保留「{old_title[:32]}」 ↛ 未套用「{new_name[:32]}」")
+        if len(review_rows) > 15:
+            rlines.append(f"  ...另 {len(review_rows) - 15} 筆")
+        try:
+            notify_error("\n".join(rlines))
+        except Exception as e:
+            logger.warning(f"  review notify err: {e}")
 
     # 不可訪問檔案通知：只在「這次新發現」時發一次（DRIVE_GONE 已標的列上面已跳過）
     if inaccessible_fids:
@@ -220,4 +288,33 @@ def run():
         "elapsed_sec": int(elapsed),
         "stats": dict(stats),
         "inaccessible_count": len(inaccessible_fids),
+        "review_held": len(review_rows),
     }
+
+
+def _append_title_sync_review(sheets_service, sid, review_rows):
+    """把守門攔下的疑似錯位 append 到 _TitleSyncReview 分頁（不存在則建立 + 寫表頭）。"""
+    import datetime
+    sheet_name = "_TitleSyncReview"
+    meta = sheets_service.spreadsheets().get(spreadsheetId=sid).execute()
+    exists = any(s["properties"]["title"] == sheet_name for s in meta.get("sheets", []))
+    if not exists:
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
+        ).execute()
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=sid,
+            range=f"'{sheet_name}'!A1",
+            valueInputOption="RAW",
+            body={"values": [["時間", "行號", "原書名(已保留)", "Drive連結檔名(未套用)", "原始檔名stem", "FileId"]]},
+        ).execute()
+    stamp = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    body = {"values": [[stamp, rn, old, new, ns, fid] for (rn, old, new, ns, fid) in review_rows]}
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=sid,
+        range=f"'{sheet_name}'!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body=body,
+    ).execute()

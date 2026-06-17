@@ -5,6 +5,7 @@ import re
 # Library 試算表 column index（0-based）
 COL_TITLE = 0       # A
 COL_SOURCE = 5      # F
+COL_NOTE = 8        # I（備註，含「原始檔名: …」＝書本不可變身分；folder_sync 分歧守門用）
 COL_COVER = 16      # Q
 COL_MARKER = 19     # T
 COL_DRIVE_LINK = 20 # U
