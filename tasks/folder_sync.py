@@ -47,9 +47,12 @@ EXT_RE = re.compile(r"\.[^.]*$")
 
 # 🛡 分歧守門門檻：新檔名與「現有書名」和「原始檔名」字詞重疊都低於此值 → 視為 Drive 連結錯位、不覆寫
 DIVERGENCE_OVERLAP_THRESHOLD = 0.34
+# 🛡 同系列換集守門：非數字詞重疊 ≥ 此值且數字（集號/章號）不同 → 視為同系列換集錯位
+SERIES_WORD_OVERLAP_THRESHOLD = 0.5
 _ORIG_NAME_RE = re.compile(r"原始檔名[:：]\s*(.+)")
 _WORD_RE = re.compile(r"[^0-9a-z一-鿿]+")
 _ZLIB_RE = re.compile(r"\(z-?library\)", re.I)
+_NUM_RE = re.compile(r"\d+")
 
 
 def strip_ext(name: str) -> str:
@@ -81,6 +84,32 @@ def title_overlap(a: str, b: str) -> float:
     if not sa:
         return 1.0
     return len(sa & sb) / len(sa)
+
+
+def _num_set(s: str) -> set:
+    """字串中所有整數 token（去前導零正規化，'09'→9、'030'→30）。"""
+    return {int(n) for n in _NUM_RE.findall(str(s or ""))}
+
+
+def is_series_volume_swap(new_name: str, ref: str) -> bool:
+    """new_name 與 ref 同系列（非數字詞高度重疊）但集號/章號不同 → 疑似同系列換集錯位。
+
+    這是 overlap 門檻的盲點補丁：同系列（如 Journey to the West ch30 vs ch67、
+    The Last Firehawk #09 vs #07）共同字多、overlap 必然 ≥0.34 會被放行 →
+    U 連結指到同系列別一集就把書名洗成別集。改用「非數字詞同系列 + 數字不同」精準偵測。
+    ref 應傳真身（原始檔名 stem）；缺則 caller 傳現書名當 proxy。
+    """
+    nums_new, nums_ref = _num_set(new_name), _num_set(ref)
+    # 兩邊都要有數字、且數字集合不同（同號＝同一集、非換集）
+    if not nums_new or not nums_ref or nums_new == nums_ref:
+        return False
+    wn, wr = _word_set(new_name), _word_set(ref)
+    if not wn or not wr:
+        return False
+    shared = len(wn & wr)
+    if shared < 2:  # 至少 2 個共同非數字詞才算「同系列」（避免單字偶然命中）
+        return False
+    return shared / min(len(wn), len(wr)) >= SERIES_WORD_OVERLAP_THRESHOLD
 
 
 def fetch_drive_meta_with_retry(drive_service, fid, retry_times: int, retry_delay: float):
@@ -204,6 +233,19 @@ def run():
             logger.warning(
                 f"[folder_sync] 🛡 守門攔下 row {row_num}：「{title[:40]}」↛「{current_stripped[:40]}」"
                 f" (overlap title={ov_title:.2f} note={ov_note:.2f}) → _TitleSyncReview"
+            )
+            continue
+
+        # 🛡 同系列換集守門：overlap 高（會被上面放行）但「新檔名 vs 真身」是同系列不同集號
+        #   ＝ U 連結指到同系列別一集（如 Journey to the West ch30↔ch67）。不覆寫，記 _TitleSyncReview。
+        #   有原始檔名 → 拿真身比（精準）；缺則拿現書名當 proxy（保守）。
+        swap_ref = note_stem if note_stem else title
+        if is_series_volume_swap(current_stripped, swap_ref):
+            stats["series_swap_held"] += 1
+            review_rows.append((row_num, title, current_stripped, note_stem, fid))
+            logger.warning(
+                f"[folder_sync] 🛡 同系列換集守門攔下 row {row_num}：「{title[:40]}」↛「{current_stripped[:40]}」"
+                f" (真身=「{swap_ref[:40]}」集號不同) → _TitleSyncReview"
             )
             continue
 
