@@ -9,3 +9,7 @@ __pycache__/
 
 # 一次性稽核腳本（2026-06-02 DRIVE_GONE 全量驗證）
 scripts/verify_drive_gone_full.py
+
+# DRIVE_GONE 回補處理產生的資料檔（含整份目錄備份，勿入版控）
+scripts/_drive_gone_plan.json
+scripts/_backup_ALL_*.json
