@@ -139,6 +139,11 @@ def job_quarantine_cleanup():
 _merge_poll_consecutive_failures = 0
 
 
+def job_inbox_queue_poller():
+    from tasks import inbox_queue_poller
+    _run_task("inbox_queue_poller", inbox_queue_poller.run)
+
+
 def job_merge_queue_poller():
     """D2 bridge — 不用 _run_task wrapper（成功也不發通知；merge_queue_poller 自己控制）。
 
@@ -224,6 +229,13 @@ def register_schedules():
     schedule.every(
         int(os.environ.get("MERGE_QUEUE_POLL_MIN", "5"))
     ).minutes.do(job_merge_queue_poller)
+
+    # inbox_queue_poller：每 INBOX_QUEUE_POLL_MIN 分鐘 poll _InboxQueue 分頁 A1（/ebook-inbox 一跑橋）
+    # GAS 收到 HTTP action enqueueZeaburTasks → 寫 A1="pending:inbox_processor,picture_books"
+    # → 此 poller 撿起 → 即時跑 Kobo pdf 落根 / 讀本草稿，不必等 16:30 / 週四排程。
+    schedule.every(
+        int(os.environ.get("INBOX_QUEUE_POLL_MIN", "2"))
+    ).minutes.do(job_inbox_queue_poller)
 
     # duplicate_merger：不自動排程；由 merge_queue_poller 透過 D2 bridge 觸發、
     # 或 LIVE_MERGE=true + RUN_ON_START=true Redeploy 手動觸發。
