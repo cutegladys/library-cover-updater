@@ -34,7 +34,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from utils.oauth import load_creds
-from utils.notify import notify_error
+from utils.notify import notify_error, notify_success
 from utils.sheets import (
     COL_TITLE, COL_SOURCE, COL_NOTE, COL_MARKER, COL_DRIVE_LINK,
     extract_file_id, sheet_id, read_all_rows,
@@ -112,6 +112,68 @@ def is_series_volume_swap(new_name: str, ref: str) -> bool:
     return shared / min(len(wn), len(wr)) >= SERIES_WORD_OVERLAP_THRESHOLD
 
 
+INDEX_SHEET = "檔案清單_Export"  # drive_index 重建的全書庫活檔索引（A=FileName B=FileId）
+_KEY_RE = re.compile(r"[^0-9a-z一-鿿]+")
+
+
+def norm_key(s: str) -> str:
+    """正規化檔名/書名為比對 key：去副檔名、轉小寫、只留英數＋中日韓。"""
+    return _KEY_RE.sub("", EXT_RE.sub("", (s or "").lower()))
+
+
+def load_backfill_index(sheets_service) -> dict:
+    """讀『檔案清單_Export』活檔索引 → {norm_key(filename): [(fileId, filename), ...]}。
+
+    drive_index 任務每週重建此分頁（trashed=false 的全書庫活檔）。folder_sync 用它把
+    『舊 fileId 死掉但檔案被重傳/搬動仍在書庫』的列救回（re-link），而非永久標 DRIVE_GONE。
+    索引缺/讀失敗 → 回空 dict（degrade 成舊行為，不回補）。
+    """
+    try:
+        vals = sheets_service.spreadsheets().values().get(
+            spreadsheetId=sheet_id(), range=f"'{INDEX_SHEET}'!A2:B",
+        ).execute().get("values", [])
+    except HttpError as e:
+        logger.warning(f"[folder_sync] 讀活檔索引失敗、停用回補：{e}")
+        return {}
+    m = {}
+    for r in vals:
+        name = r[0] if len(r) > 0 else ""
+        fid = r[1] if len(r) > 1 else ""
+        if name and fid:
+            m.setdefault(norm_key(name), []).append((fid, name))
+    return m
+
+
+def find_backfill(key2files: dict, alive_fids: set, title: str, note_stem: str):
+    """在活檔索引找『同一本書還活著的檔』。回 (new_fid, new_name) 或 None。
+
+    用原始檔名(真身)優先、否則書名比對；套 folder_sync 同一把守門（詞重疊≥門檻＋非同系列換集）
+    避免 re-link 到錯書（對齊 2026-06-17 書名洗錯教訓）。命中的 fid 已被別 alive 列用 → 回 None
+    （避免製造重複列）。多命中 → 精準檔名→最高 overlap→fileId 字典序 確定性挑一個。
+    """
+    if not key2files:
+        return None
+    ref = note_stem or title
+    ref_s = strip_ext(ref)
+    cands = key2files.get(norm_key(ref_s), [])
+    good = [
+        (cfid, cnm) for cfid, cnm in cands
+        if title_overlap(strip_ext(cnm), ref_s) >= DIVERGENCE_OVERLAP_THRESHOLD
+        and not is_series_volume_swap(strip_ext(cnm), ref_s)
+    ]
+    if not good:
+        return None
+    good.sort(key=lambda x: (
+        strip_ext(x[1]).lower() != ref_s.lower(),
+        -title_overlap(strip_ext(x[1]), ref_s),
+        x[0],
+    ))
+    new_fid, new_name = good[0]
+    if new_fid in alive_fids:
+        return None
+    return new_fid, new_name
+
+
 def fetch_drive_meta_with_retry(drive_service, fid, retry_times: int, retry_delay: float):
     """打 drive.files().get、5xx / 429 自動 retry。回 (meta, last_err_status)。"""
     last_status = None
@@ -183,31 +245,61 @@ def run():
     if not candidates:
         return {"task": "folder_sync", "targets": 0, "note": "no_new_books"}
 
+    # 回補用：活檔索引 + 目前已被別列使用的 fileId（避免回補製造重複列）
+    key2files = load_backfill_index(sheets_service)
+    alive_fids = set()
+    for row in rows:
+        while len(row) <= COL_DRIVE_LINK:
+            row.append("")
+        if str(row[COL_MARKER]).strip() == "DRIVE_GONE":
+            continue
+        afid = extract_file_id(str(row[COL_DRIVE_LINK]))
+        if afid:
+            alive_fids.add(afid)
+    logger.info(f"[folder_sync] 活檔索引 {len(key2files)} key / alive fileId {len(alive_fids)}")
+
     # 對每個 candidate 查 Drive 當前檔名
     updates = []  # batchUpdate body
     stats = Counter()
     start = time.time()
     inaccessible_fids = []  # list of (row_num, fid, title, status)
+    backfilled = []  # 回補成功 (row_num, old_fid, new_fid, new_name)、用於通知與清 marker
     review_rows = []  # 🛡 分歧守門攔下、未覆寫的疑似錯位 (row_num, old_title, new_name, note_stem, fid)
+
+    def _try_backfill_or_mark(row_num, fid, title, note_stem, reason):
+        """死連結：先試索引回補 re-link；找不到才列入 inaccessible（→標 DRIVE_GONE）。"""
+        hit = find_backfill(key2files, alive_fids, title, note_stem)
+        if hit:
+            new_fid, new_name = hit
+            alive_fids.add(new_fid)
+            updates.append({
+                "range": f"'ALL'!U{row_num}",
+                "values": [[f"https://drive.google.com/file/d/{new_fid}/view?usp=drivesdk"]],
+            })
+            backfilled.append((row_num, fid, new_fid, new_name))
+            stats["backfilled"] += 1
+            logger.info(f"[folder_sync] ♻ 回補 row {row_num}：死連結→活檔「{new_name[:40]}」({reason})")
+            return
+        inaccessible_fids.append((row_num, fid, title, reason))
 
     for i, (row_num, fid, title, note_stem) in enumerate(candidates, 1):
         meta, err_status = fetch_drive_meta_with_retry(drive_service, fid, retry_times, retry_delay)
         if meta is None:
             if err_status == 404:
                 stats["dead_404"] += 1
-                inaccessible_fids.append((row_num, fid, title, "404 not found"))
+                _try_backfill_or_mark(row_num, fid, title, note_stem, "404 not found")
             elif err_status == 403:
                 stats["dead_403"] += 1
-                inaccessible_fids.append((row_num, fid, title, "403 permission denied"))
+                _try_backfill_or_mark(row_num, fid, title, note_stem, "403 permission denied")
             else:
                 stats[f"meta_err_{err_status}"] += 1
                 if err_status:
-                    inaccessible_fids.append((row_num, fid, title, f"err {err_status}"))
+                    _try_backfill_or_mark(row_num, fid, title, note_stem, f"err {err_status}")
             continue
 
         if meta.get("trashed"):
             stats["trashed"] += 1
-            inaccessible_fids.append((row_num, fid, title, "trashed"))
+            _try_backfill_or_mark(row_num, fid, title, note_stem, "trashed")
             continue
 
         current_name = meta.get("name", "")
@@ -263,12 +355,44 @@ def run():
     elapsed = time.time() - start
     logger.info(f"[folder_sync] 比對完成 elapsed={elapsed:.0f}s, 待更新 {len(updates)} 筆")
 
+    # ♻ 自我修復：對既有 DRIVE_GONE 列做一次純記憶體索引比對（不打 Drive API）。
+    #   drive_index 每週刷新索引後，曾因索引 stale 被標 DRIVE_GONE 但檔案其實在書庫的列
+    #   會在此被自動救回 → 改寫 U + 清 T，不再永久卡死。
+    self_healed = []  # (row_num, new_fid, new_name)
+    for ridx, row in enumerate(rows, start=2):
+        while len(row) <= COL_DRIVE_LINK:
+            row.append("")
+        if str(row[COL_MARKER]).strip() != "DRIVE_GONE":
+            continue
+        if str(row[COL_SOURCE]).strip() != SOURCE_FILTER:
+            continue
+        gtitle = str(row[COL_TITLE]).strip()
+        gnote = extract_orig_stem(str(row[COL_NOTE]) if len(row) > COL_NOTE else "")
+        hit = find_backfill(key2files, alive_fids, gtitle, gnote)
+        if not hit:
+            continue
+        new_fid, new_name = hit
+        alive_fids.add(new_fid)
+        updates.append({
+            "range": f"'ALL'!U{ridx}",
+            "values": [[f"https://drive.google.com/file/d/{new_fid}/view?usp=drivesdk"]],
+        })
+        self_healed.append((ridx, new_fid, new_name))
+        stats["self_healed"] += 1
+    if self_healed:
+        logger.info(f"[folder_sync] ♻ 自我修復既有 DRIVE_GONE {len(self_healed)} 列（索引刷新後救回）")
+
     # 把這次新發現不可訪問的列 T 欄打 DRIVE_GONE marker，下次 cron 自動跳過
     marker_updates = [
         {"range": f"'ALL'!T{row_num}", "values": [["DRIVE_GONE"]]}
         for row_num, _fid, _title, _reason in inaccessible_fids
     ]
-    all_updates = updates + marker_updates
+    # 回補/自我修復成功的列：清掉 T（DRIVE_GONE）讓它重回正常流程
+    clear_marker_updates = [
+        {"range": f"'ALL'!T{row_num}", "values": [[""]]}
+        for row_num, *_ in (backfilled + self_healed)
+    ]
+    all_updates = updates + marker_updates + clear_marker_updates
 
     # batchUpdate 一次寫回（dry-run 時跳過）
     if all_updates and not dry_run:
@@ -312,9 +436,24 @@ def run():
         except Exception as e:
             logger.warning(f"  review notify err: {e}")
 
-    # 不可訪問檔案通知：只在「這次新發現」時發一次（DRIVE_GONE 已標的列上面已跳過）
+    # ♻ 回補通知：死連結但在書庫找到活檔、已自動 re-link（含本次新發現回補 + 既有 DRIVE_GONE 自我修復）
+    total_backfill = len(backfilled) + len(self_healed)
+    if total_backfill:
+        blines = [f"♻ folder_sync：{total_backfill} 個死連結自動回補（檔案被重傳/搬動換了 fileId、仍在書庫）→ 已 re-link"]
+        if backfilled:
+            blines.append(f"  本次掃描新回補 {len(backfilled)}；既有 DRIVE_GONE 自我修復 {len(self_healed)}")
+        for row_num, _ofid, _nfid, new_name in backfilled[:10]:
+            blines.append(f"  row {row_num} | → 活檔「{new_name[:40]}」")
+        for row_num, _nfid, new_name in self_healed[:10]:
+            blines.append(f"  row {row_num} | (自我修復) → 活檔「{new_name[:40]}」")
+        try:
+            notify_success("\n".join(blines))
+        except Exception as e:
+            logger.warning(f"  backfill notify err: {e}")
+
+    # 不可訪問檔案通知：只在「這次新發現、且回補也找不到」時發一次（DRIVE_GONE 已標的列上面已跳過）
     if inaccessible_fids:
-        lines = [f"⚠️ folder_sync：本次新發現 {len(inaccessible_fids)} 個 Drive 檔案無法訪問（404/403/trashed），已自動標 T=DRIVE_GONE，未來 cron 不再重打"]
+        lines = [f"⚠️ folder_sync：本次新發現 {len(inaccessible_fids)} 個 Drive 檔案無法訪問（404/403/trashed）且書庫索引找不到回補活檔，已自動標 T=DRIVE_GONE，未來 cron 不再重打"]
         for row_num, fid, title, reason in inaccessible_fids[:20]:
             lines.append(f"  row {row_num} | {title[:40]} | {reason}")
         if len(inaccessible_fids) > 20:
@@ -330,6 +469,8 @@ def run():
         "elapsed_sec": int(elapsed),
         "stats": dict(stats),
         "inaccessible_count": len(inaccessible_fids),
+        "backfilled_count": len(backfilled),
+        "self_healed_count": len(self_healed),
         "review_held": len(review_rows),
     }
 
