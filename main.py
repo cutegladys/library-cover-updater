@@ -139,9 +139,38 @@ def job_quarantine_cleanup():
 _merge_poll_consecutive_failures = 0
 
 
+# inbox_queue_poller 連續失敗計數：同 merge_queue_poller —— 單次網路 blip
+# （read timeout 等）會自癒。_InboxQueue A1 旗標維持 pending 直到成功處理，
+# 下個 2 分鐘週期自動接手；故單次失敗靜默，連續 N 次才發 Telegram（§七 rule 17）。
+_inbox_poll_consecutive_failures = 0
+
+
 def job_inbox_queue_poller():
-    from tasks import inbox_queue_poller
-    _run_task("inbox_queue_poller", inbox_queue_poller.run)
+    """/ebook-inbox 一跑橋 —— 不用 _run_task wrapper（單次網路逾時不通知）。
+
+    單次失敗（多為短暫網路逾時、OAuth refresh / Sheets read timeout）不通知——
+    poller 自癒、下個 INBOX_QUEUE_POLL_MIN 分鐘週期重試。
+    連續 >= INBOX_QUEUE_FAIL_NOTIFY_THRESHOLD 次（預設 3）才發 Telegram。
+    注意：真正的 task 失敗在 inbox_queue_poller.run() 內已自行寫 failed_* + notify_error
+    （actionable），這裡只處理「還沒進到處理就掛掉」（creds / build / read timeout）的網路類失敗。
+    """
+    global _inbox_poll_consecutive_failures
+    try:
+        from tasks import inbox_queue_poller
+        inbox_queue_poller.run()
+        _inbox_poll_consecutive_failures = 0
+    except Exception as e:
+        _inbox_poll_consecutive_failures += 1
+        n = _inbox_poll_consecutive_failures
+        logger.error(f"inbox_queue_poller exception (#{n}): {e}")
+        threshold = int(os.environ.get("INBOX_QUEUE_FAIL_NOTIFY_THRESHOLD", "3"))
+        if n >= threshold:
+            from utils.notify import notify_error
+            poll_min = int(os.environ.get("INBOX_QUEUE_POLL_MIN", "2"))
+            notify_error(
+                f"❌ inbox_queue_poller 連續 {n} 次異常"
+                f"（約 {n * poll_min} 分鐘無法推進）：{e}"
+            )
 
 
 def job_merge_queue_poller():
