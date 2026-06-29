@@ -112,8 +112,9 @@ def is_series_volume_swap(new_name: str, ref: str) -> bool:
     return shared / min(len(wn), len(wr)) >= SERIES_WORD_OVERLAP_THRESHOLD
 
 
-INDEX_SHEET = "檔案清單_Export"  # drive_index 重建的全書庫活檔索引（A=FileName B=FileId）
+INDEX_SHEET = "檔案清單_Export"  # drive_index 重建的全書庫活檔索引（A=FileName B=FileId F=MD5）
 _KEY_RE = re.compile(r"[^0-9a-z一-鿿]+")
+_EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"  # 0-byte 檔 md5（會假比對，排除）
 
 
 def norm_key(s: str) -> str:
@@ -121,27 +122,47 @@ def norm_key(s: str) -> str:
     return _KEY_RE.sub("", EXT_RE.sub("", (s or "").lower()))
 
 
-def load_backfill_index(sheets_service) -> dict:
-    """讀『檔案清單_Export』活檔索引 → {norm_key(filename): [(fileId, filename), ...]}。
+def load_backfill_index(sheets_service):
+    """讀『檔案清單_Export』活檔索引 → (key2files, md52files)。
+
+    - key2files: {norm_key(filename): [(fileId, filename), ...]}（檔名比對，舊有）
+    - md52files: {md5: [(fileId, filename), ...]}（F 欄 MD5，byte 相同最可靠；F 欄缺則為空 dict）
 
     drive_index 任務每週重建此分頁（trashed=false 的全書庫活檔）。folder_sync 用它把
     『舊 fileId 死掉但檔案被重傳/搬動仍在書庫』的列救回（re-link），而非永久標 DRIVE_GONE。
-    索引缺/讀失敗 → 回空 dict（degrade 成舊行為，不回補）。
+    索引缺/讀失敗 → 回 ({}, {})（degrade 成舊行為，不回補）。F 欄尚未由新版 drive_index
+    寫入時 md52files 為空 → 自動退回純檔名比對（向後相容）。
     """
     try:
         vals = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sheet_id(), range=f"'{INDEX_SHEET}'!A2:B",
+            spreadsheetId=sheet_id(), range=f"'{INDEX_SHEET}'!A2:F",
         ).execute().get("values", [])
     except HttpError as e:
         logger.warning(f"[folder_sync] 讀活檔索引失敗、停用回補：{e}")
-        return {}
-    m = {}
+        return {}, {}
+    key2files, md52files = {}, {}
     for r in vals:
         name = r[0] if len(r) > 0 else ""
         fid = r[1] if len(r) > 1 else ""
+        md5 = r[5] if len(r) > 5 else ""
         if name and fid:
-            m.setdefault(norm_key(name), []).append((fid, name))
-    return m
+            key2files.setdefault(norm_key(name), []).append((fid, name))
+        if fid and md5 and md5 != _EMPTY_MD5:
+            md52files.setdefault(md5, []).append((fid, name))
+    return key2files, md52files
+
+
+def find_backfill_md5(md52files: dict, alive_fids: set, md5: str):
+    """用 MD5 在活檔索引找『同一份檔（byte 相同）還活著的檔』。回 (new_fid, new_name) 或 None。
+
+    byte 完全相同即同一本書（最可靠、免守門 overlap）。命中 fid 已被別 alive 列用 → 回 None。
+    """
+    if not md5 or md5 == _EMPTY_MD5 or not md52files:
+        return None
+    for fid, name in md52files.get(md5, []):
+        if fid not in alive_fids:
+            return fid, name
+    return None
 
 
 def find_backfill(key2files: dict, alive_fids: set, title: str, note_stem: str):
@@ -181,7 +202,7 @@ def fetch_drive_meta_with_retry(drive_service, fid, retry_times: int, retry_dela
         try:
             meta = drive_service.files().get(
                 fileId=fid,
-                fields="name,trashed",
+                fields="name,trashed,md5Checksum",
                 supportsAllDrives=True,
             ).execute()
             return meta, None
@@ -245,8 +266,8 @@ def run():
     if not candidates:
         return {"task": "folder_sync", "targets": 0, "note": "no_new_books"}
 
-    # 回補用：活檔索引 + 目前已被別列使用的 fileId（避免回補製造重複列）
-    key2files = load_backfill_index(sheets_service)
+    # 回補用：活檔索引（檔名 + md5）+ 目前已被別列使用的 fileId（避免回補製造重複列）
+    key2files, md52files = load_backfill_index(sheets_service)
     alive_fids = set()
     for row in rows:
         while len(row) <= COL_DRIVE_LINK:
@@ -256,7 +277,7 @@ def run():
         afid = extract_file_id(str(row[COL_DRIVE_LINK]))
         if afid:
             alive_fids.add(afid)
-    logger.info(f"[folder_sync] 活檔索引 {len(key2files)} key / alive fileId {len(alive_fids)}")
+    logger.info(f"[folder_sync] 活檔索引 {len(key2files)} key / {len(md52files)} md5 / alive fileId {len(alive_fids)}")
 
     # 對每個 candidate 查 Drive 當前檔名
     updates = []  # batchUpdate body
@@ -266,9 +287,17 @@ def run():
     backfilled = []  # 回補成功 (row_num, old_fid, new_fid, new_name)、用於通知與清 marker
     review_rows = []  # 🛡 分歧守門攔下、未覆寫的疑似錯位 (row_num, old_title, new_name, note_stem, fid)
 
-    def _try_backfill_or_mark(row_num, fid, title, note_stem, reason):
-        """死連結：先試索引回補 re-link；找不到才列入 inaccessible（→標 DRIVE_GONE）。"""
-        hit = find_backfill(key2files, alive_fids, title, note_stem)
+    def _try_backfill_or_mark(row_num, fid, title, note_stem, reason, md5=None):
+        """死連結：先試索引回補 re-link；找不到才列入 inaccessible（→標 DRIVE_GONE）。
+
+        回補優先序：① md5（byte 相同最可靠，今日 quarantine 清隔離副本→孤兒的根治）
+        ② 檔名（舊邏輯，套守門 overlap）。md5 索引缺（F 欄未寫）時自動只走檔名。
+        """
+        hit = find_backfill_md5(md52files, alive_fids, md5)
+        how = "md5"
+        if not hit:
+            hit = find_backfill(key2files, alive_fids, title, note_stem)
+            how = "name"
         if hit:
             new_fid, new_name = hit
             alive_fids.add(new_fid)
@@ -278,7 +307,8 @@ def run():
             })
             backfilled.append((row_num, fid, new_fid, new_name))
             stats["backfilled"] += 1
-            logger.info(f"[folder_sync] ♻ 回補 row {row_num}：死連結→活檔「{new_name[:40]}」({reason})")
+            stats[f"backfilled_by_{how}"] += 1
+            logger.info(f"[folder_sync] ♻ 回補 row {row_num}：死連結→活檔「{new_name[:40]}」(by {how}, {reason})")
             return
         inaccessible_fids.append((row_num, fid, title, reason))
 
@@ -299,7 +329,8 @@ def run():
 
         if meta.get("trashed"):
             stats["trashed"] += 1
-            _try_backfill_or_mark(row_num, fid, title, note_stem, "trashed")
+            # trashed 檔仍可取 md5Checksum → 優先用 md5 回補（quarantine 清隔離副本→孤兒的根治）
+            _try_backfill_or_mark(row_num, fid, title, note_stem, "trashed", md5=meta.get("md5Checksum"))
             continue
 
         current_name = meta.get("name", "")
@@ -355,8 +386,10 @@ def run():
     elapsed = time.time() - start
     logger.info(f"[folder_sync] 比對完成 elapsed={elapsed:.0f}s, 待更新 {len(updates)} 筆")
 
-    # ♻ 自我修復：對既有 DRIVE_GONE 列做一次純記憶體索引比對（不打 Drive API）。
-    #   drive_index 每週刷新索引後，曾因索引 stale 被標 DRIVE_GONE 但檔案其實在書庫的列
+    # ♻ 自我修復：對既有 DRIVE_GONE 列做一次索引比對。
+    #   先純記憶體檔名比對（不打 Drive API）；檔名沒中再用該列 fileId 取 md5 做 byte 比對
+    #   （md5 fetch 只發生在「檔名沒中」的 DRIVE_GONE 列、數量有限，救回率高）。
+    #   drive_index 刷新索引後，曾因索引 stale 或檔名對不上被標 DRIVE_GONE 但檔案其實在書庫的列
     #   會在此被自動救回 → 改寫 U + 清 T，不再永久卡死。
     self_healed = []  # (row_num, new_fid, new_name)
     for ridx, row in enumerate(rows, start=2):
@@ -369,6 +402,18 @@ def run():
         gtitle = str(row[COL_TITLE]).strip()
         gnote = extract_orig_stem(str(row[COL_NOTE]) if len(row) > COL_NOTE else "")
         hit = find_backfill(key2files, alive_fids, gtitle, gnote)
+        if not hit and md52files:
+            # 檔名沒中 → 用該列原 fileId 取 md5（trashed 仍可取）做 byte 比對
+            gfid = extract_file_id(str(row[COL_DRIVE_LINK]))
+            if gfid:
+                try:
+                    gm = drive_service.files().get(
+                        fileId=gfid, fields="md5Checksum", supportsAllDrives=True).execute()
+                    hit = find_backfill_md5(md52files, alive_fids, gm.get("md5Checksum"))
+                    if hit:
+                        stats["self_healed_by_md5"] += 1
+                except HttpError:
+                    pass
         if not hit:
             continue
         new_fid, new_name = hit

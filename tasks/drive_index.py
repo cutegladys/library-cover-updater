@@ -61,7 +61,7 @@ def list_files_with_metadata(drive_service, root_id: str):
             try:
                 r = drive_service.files().list(
                     q=f"'{folder_id}' in parents and trashed=false",
-                    fields="nextPageToken, files(id, name, mimeType, webViewLink, modifiedTime)",
+                    fields="nextPageToken, files(id, name, mimeType, webViewLink, modifiedTime, md5Checksum)",
                     pageSize=PAGE_SIZE,
                     pageToken=page_token,
                     supportsAllDrives=True,
@@ -81,6 +81,7 @@ def list_files_with_metadata(drive_service, root_id: str):
                         "url": f.get("webViewLink", f"https://drive.google.com/file/d/{f['id']}/view"),
                         "path": current_path,
                         "modified": f.get("modifiedTime", ""),
+                        "md5": f.get("md5Checksum", ""),  # F 欄：供 folder_sync md5 回補（byte 相同最可靠）
                     })
 
             page_token = r.get("nextPageToken")
@@ -129,15 +130,15 @@ def run():
     # 確保分頁存在
     ensure_index_sheet(sheets_service, sid)
 
-    # 組 rows
-    rows = [["FileName", "FileId", "URL", "FolderPath", "LastUpdated"]]
+    # 組 rows（F=MD5 供 folder_sync md5 回補）
+    rows = [["FileName", "FileId", "URL", "FolderPath", "LastUpdated", "MD5"]]
     for f in all_files:
-        rows.append([f["name"][:200], f["id"], f["url"], f["path"][:200], f["modified"]])
+        rows.append([f["name"][:200], f["id"], f["url"], f["path"][:200], f["modified"], f.get("md5", "")])
 
     # clear + write（dashboard / picture_books 讀這分頁、要最新）
     try:
         sheets_service.spreadsheets().values().clear(
-            spreadsheetId=sid, range=f"'{INDEX_SHEET}'!A:E",
+            spreadsheetId=sid, range=f"'{INDEX_SHEET}'!A:F",
         ).execute()
     except HttpError:
         pass
