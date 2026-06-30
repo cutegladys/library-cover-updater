@@ -34,6 +34,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from utils.oauth import load_creds
 from utils.sheets import sheet_id
+from utils.normalizer import normalize_filename
 
 logger = logging.getLogger("library_cover_updater.picture_books")
 
@@ -44,6 +45,22 @@ DRAFT_SHEET = "_PB_Draft"
 # 對應 GAS _PB
 SOURCE_VALUE = "Google Drive"
 STATUS_VALUE = "已擁有"
+
+# ── 繪本/讀本判定（對齊 GAS pictureBooksProcessor.js _PB.BOOK_EXTENSIONS / _pbBookVerdict）──
+# Drive 樹裝整套英文閱讀課程（不只繪本），故對孤兒檔做白名單 + 噪音過濾：
+# 只把「書檔副檔名」當候選，其餘（音檔/影片/簡報/壓縮檔）一律不收。
+BOOK_EXTENSIONS = {"pdf", "epub", "mobi", "azw3", "azw", "cbz", "cbr"}
+
+# 通用「容器葉夾名」：夾名本身不是書名（裝整套課程的桶子）。葉夾 ∈ 此集合時，
+# 草稿書名退回「檔名去副檔名」而非夾名（否則 /西遊記/Ebook/*.pdf 全變書名「Ebook」）。
+# 大小寫不敏感比對。
+GENERIC_LEAF_FOLDERS = {
+    "ebook", "ebooks", "e-book", "e-books",
+    "pdf", "pdfs", "epub", "epubs", "mobi", "azw3",
+    "mp3", "mp3s", "audio", "audios", "音檔", "音档", "音頻", "音频", "有聲", "有声", "錄音", "录音",
+    "cartoon", "cartoons", "video", "videos", "影片", "視頻", "视频", "動畫", "动画",
+    "book", "books", "doc", "docs", "file", "files",
+}
 
 
 def list_files_recursive(drive_service, root_id: str):
@@ -138,11 +155,119 @@ def parse_epub_meta_safe(epub_bytes):
         return None, None
 
 
+def _file_ext(name: str) -> str:
+    """取檔名小寫副檔名（無則空字串）。"""
+    m = re.search(r"\.([A-Za-z0-9]+)$", str(name or ""))
+    return m.group(1).lower() if m else ""
+
+
+def _leaf_folder(path: str) -> str:
+    """資料夾路徑的葉節點名（最後一段）。"""
+    return path.rstrip("/").split("/")[-1] if path else ""
+
+
+def guess_title_from_structure(orphan: dict) -> str:
+    """
+    用「資料夾/檔名」結構猜草稿書名（不下載、不 parse meta）。
+    - 葉資料夾名有意義（非通用容器名）→ 用葉資料夾名（一個系列共用一個書名，配合同名去重收一筆代表）。
+    - 葉資料夾是通用容器名（Ebook/PDF/MP3/cartoon…）或無資料夾 → 退回「檔名去副檔名」，
+      再過 normalize_filename 清廣告/出版社標籤/全形（對齊 inbox normalizer）。
+    與 GAS _pbWriteDraft / _pbFilterOrphans 的 title 計算一致；簡轉繁由 run() 統一處理。
+    """
+    folder = _leaf_folder(orphan.get("path", "")).strip()
+    if folder and folder.lower() not in GENERIC_LEAF_FOLDERS:
+        return folder
+    base = re.sub(r"\.[^.]+$", "", str(orphan.get("name", "")))
+    return (normalize_filename(base) or base).strip()
+
+
+def _mostly_garbled(s: str) -> bool:
+    """粗判標題是否「多數為亂碼」（對齊 GAS _pbMostlyGarbled）。"""
+    if not s or len(s) < 4:
+        return False
+    suspicious = total = 0
+    for ch in s:
+        c = ord(ch)
+        total += 1
+        ok = (
+            (0x4E00 <= c <= 0x9FFF)    # CJK 漢字
+            or (0x3000 <= c <= 0x30FF)  # 全形標點 + 假名
+            or (0xFF00 <= c <= 0xFFEF)  # 全形英數/標點
+            or (0x20 <= c <= 0x7E)      # 基本 ASCII 可印字
+        )
+        if not ok:
+            suspicious += 1
+    return total > 0 and (suspicious / total) > 0.4
+
+
+def book_verdict(file_name: str, title: str):
+    """
+    判定一個孤兒檔像不像一本繪本/讀本（對齊 GAS _pbBookVerdict）。
+    @return (ok: bool, reason: str | None)
+    """
+    fn = str(file_name or "")
+    t = str(title or "").strip()
+
+    # 1. 副檔名白名單（擋 mp3/m4a/mp4/mov/ppt/pptx/zip…）
+    ext = _file_ext(fn)
+    if ext not in BOOK_EXTENSIONS:
+        return False, f"非書檔副檔名（.{ext or '無'}）"
+
+    hay = t + " " + fn
+    # 2. 標題含音檔/影片/簡報關鍵字（命名殘留）
+    if re.search(r"MP3|音[頻频檔档]|有聲|錄音|audio|video|視頻|影片|slides?|ppt", hay, re.I):
+        return False, "標題含音檔/影片/簡報關鍵字"
+    # 3. 課程代碼樣式（如 TRN2_EB_BE_KS…）：純英數+底線、≥2 個底線、無空白
+    if re.match(r"^[A-Za-z0-9]+(_[A-Za-z0-9]+){2,}$", t):
+        return False, "課程代碼樣式"
+    # 4. 純季/單元/Level/Week/Lesson 碼（S1 / U1 / L3 / Unit1 / Week2…）
+    if re.match(r"^(S|U|L|W|D|Unit|Week|Lesson|Level|Day|Part|Book)\s*\.?\s*\d{1,3}$", t, re.I):
+        return False, "純季/單元/Level 碼"
+    # 5. 亂碼/編碼壞：含 box-drawing / block / replacement char，或多數字元非可讀
+    if re.search(r"[─-▟�]", t) or _mostly_garbled(t):
+        return False, "亂碼/編碼壞"
+    # 6. 標題過短/空（去掉空白與分隔符後 < 2 個字元）
+    if len(re.sub(r"[\s_\-.]", "", t)) < 2:
+        return False, "標題過短/空"
+
+    return True, None
+
+
+def filter_orphans(orphans: list):
+    """
+    對 orphans 做兩層過濾（對齊 GAS _pbFilterOrphans）：
+      (1) 逐檔 book_verdict（副檔名白名單 + 音檔/影片/簡報關鍵字 + 課程碼 + 單元碼 + 亂碼 + 過短）。
+      (2) 同名（= 同系列/同資料夾，因草稿書名取資料夾名）只收第一筆代表。
+    @return (kept: list, rejected: dict{reason: count})
+    """
+    kept = []
+    rejected = {}
+    seen_title = set()
+
+    def rej(reason):
+        rejected[reason] = rejected.get(reason, 0) + 1
+
+    for o in orphans:
+        title = guess_title_from_structure(o)
+        ok, reason = book_verdict(o.get("name", ""), title)
+        if not ok:
+            rej(reason)
+            continue
+        key = title.lower()
+        if key in seen_title:
+            rej("同名重複（已收第一筆）")
+            continue
+        seen_title.add(key)
+        kept.append(o)
+
+    return kept, rejected
+
+
 def guess_title_author(drive_service, orphan: dict, parse_epub: bool):
     """
     對 orphan 猜書名/作者。
-    - 如 PB_PARSE_EPUB_META=true 且 mime=epub → 下載 + parse content.opf
-    - fallback: folder name 或檔名（去副檔名）
+    - 如 PB_PARSE_EPUB_META=true 且 mime=epub → 下載 + parse content.opf（書名/作者）
+    - fallback: guess_title_from_structure（葉資料夾名；通用容器夾退回檔名去副檔名）
     """
     title = None
     author = ""
@@ -160,13 +285,7 @@ def guess_title_author(drive_service, orphan: dict, parse_epub: bool):
             logger.warning(f"  epub parse err {orphan['id']}: {e}")
 
     if not title:
-        # folder name fallback
-        folder_name = orphan["path"].rstrip("/").split("/")[-1] if orphan["path"] else ""
-        if folder_name:
-            title = folder_name
-        else:
-            # 檔名去副檔名
-            title = re.sub(r"\.[^.]+$", "", orphan["name"])
+        title = guess_title_from_structure(orphan)
 
     return title or "", author or ""
 
@@ -222,10 +341,27 @@ def run():
         if f["id"] not in known_fids
         and ("_duplicates_quarantine" in f.get("path", "") or "_duplicates_quarantine" in f.get("name", ""))
     )
-    logger.info(f"[picture_books] Orphans: {len(orphans)}（已排除 _duplicates_quarantine {quarantine_skipped} 個）")
+    logger.info(f"[picture_books] Orphans（未過濾）: {len(orphans)}（已排除 _duplicates_quarantine {quarantine_skipped} 個）")
+
+    # ── 過濾掉非繪本/讀本的檔（對齊 GAS _pbFilterOrphans）──
+    # Drive 樹裝整套英文閱讀課程：孤兒裡多半是音檔/影片/簡報/課程碼/單元碼/亂碼/同名重複。
+    # 只留「像繪本/讀本」的書檔，並對同名（=同系列/同資料夾）只收一筆代表。
+    raw_orphan_count = len(orphans)
+    orphans, rejected = filter_orphans(orphans)
+    if rejected:
+        rej_report = "；".join(
+            f"{k}:{v}" for k, v in sorted(rejected.items(), key=lambda kv: -kv[1])
+        )
+        logger.info(
+            f"[picture_books] 過濾後保留 {len(orphans)} 筆（排除 {raw_orphan_count - len(orphans)}）：{rej_report}"
+        )
+    else:
+        logger.info(f"[picture_books] 過濾後保留 {len(orphans)} 筆（無排除）")
 
     if not orphans:
-        return {"task": "picture_books", "targets": 0, "stats": {"orphans": 0}, "note": "no_orphans"}
+        return {"task": "picture_books", "targets": 0,
+                "stats": {"orphans_raw": raw_orphan_count, "orphans": 0, "rejected": rejected},
+                "note": "no_orphans_after_filter"}
 
     # 對每個 orphan guess title/author + 簡轉繁
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -307,7 +443,8 @@ def run():
 
     if dry_run:
         return {"task": "picture_books", "targets": len(orphans), "stats": {
-            "orphans": len(orphans), "append_planned": len(new_rows),
+            "orphans_raw": raw_orphan_count, "orphans": len(orphans), "rejected": rejected,
+            "append_planned": len(new_rows),
             "delete_planned": len(rows_to_delete), "s2t_changed": s2t_changed, "dry_run": True,
         }}
 
@@ -339,7 +476,9 @@ def run():
         ).execute()
 
     stats = {
+        "orphans_raw": raw_orphan_count,
         "orphans": len(orphans),
+        "rejected": rejected,
         "appended": len(new_rows),
         "deleted_done": len(rows_to_delete),
         "kept_existing": len(existing_data) - len(rows_to_delete),
