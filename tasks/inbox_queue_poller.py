@@ -8,8 +8,9 @@ Inbox Queue Poller — /ebook-inbox 一跑到底 的 Zeabur 端即時觸發器
 - A1 = "done_*" / "failed_*" / 空 → 不動
 
 可觸發的 task（白名單）：
-- inbox_processor  Kobo eBookReading/_inbox 的 pdf 即時落根 + 封面 + 寫 ALL
-- picture_books    英文讀本資源 掃 Drive 孤兒 → _PB_Draft 草稿（讀本當場 review 用）
+- inbox_processor       Kobo eBookReading/_inbox 的 pdf 即時落根 + 封面 + 寫 ALL
+- picture_books         英文讀本資源 掃 Drive 孤兒 → _PB_Draft 草稿（讀本當場 review 用）
+- review_epub_processor Kobo eBookReading/_inbox/_review 的大 epub（GAS 解不開 punt 來的）即時補編目落根
 
 GAS 端：Library doPost 收到 HTTP action enqueueZeaburTasks 時寫 A1="pending:..."
 （見 libraryHttpActions.js _enqueueZeaburTasks）。/ebook-inbox skill 前置路由完、
@@ -38,7 +39,7 @@ QUEUE_SHEET = "_InboxQueue"
 QUEUE_CELL = f"'{QUEUE_SHEET}'!A1"
 
 # 與 GAS libraryHttpActions.js ZEABUR_TASK_WHITELIST 對齊（雙端白名單、防誤觸）
-TASK_WHITELIST = ("inbox_processor", "picture_books")
+TASK_WHITELIST = ("inbox_processor", "picture_books", "review_epub_processor")
 
 _RETRYABLE_STATUSES = (409, 429, 500, 502, 503, 504)
 
@@ -130,6 +131,9 @@ def _run_one(task_name: str):
     if task_name == "picture_books":
         from tasks import picture_books
         return picture_books.run()
+    if task_name == "review_epub_processor":
+        from tasks import review_epub_processor
+        return review_epub_processor.run()
     raise ValueError(f"未知 task：{task_name}")
 
 

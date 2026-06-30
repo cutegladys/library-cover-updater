@@ -177,6 +177,68 @@ def parse_epub_meta(epub_bytes: bytes):
     }
 
 
+def simp_to_trad_meta(meta: dict) -> dict:
+    """meta 的 title/author/series 簡→繁（zhconv 純 Python；失敗保留原文）。in-place + 回傳 meta。
+
+    inbox_processor（pdf）與 review_epub_processor（_review 大 epub）共用，
+    對齊 GAS inboxProcessor.js 步驟 2.5 simplifiedToTraditionalBatch。
+    """
+    try:
+        from zhconv import convert as zh_convert
+        for k in ("title", "author", "series"):
+            v = meta.get(k)
+            if v:
+                conv = zh_convert(v, "zh-tw")
+                if conv != v:
+                    logger.info(f"  🔁 {k} 簡→繁：{v} → {conv}")
+                meta[k] = conv
+    except Exception as e:
+        logger.warning(f"  簡轉繁失敗（保留原文）：{e}")
+    return meta
+
+
+def derive_clean_name(meta: dict, ext: str, orig_name: str = ""):
+    """從 meta 組出 (clean_title, clean_author, new_name)，對齊 GAS inboxProcessor.js 步驟 3。
+
+    系列拼接 → normalize → 原始檔名明顯更長且含 title 時改用原始檔名（系列資訊較全）。
+    inbox_processor（pdf）與 review_epub_processor（_review 大 epub）共用，單一真相。
+    """
+    raw_title = meta["title"]
+    clean_author = normalize_author(meta.get("author", ""))
+
+    # 系列拼接（GAS 邏輯）
+    if meta.get("series"):
+        series_core = re.sub(r"\s+\d+(\.\d+)?$", "", meta["series"]).strip()
+        already_has = series_core.lower() in raw_title.lower()
+        if not already_has:
+            idx_str = ""
+            if meta.get("series_index"):
+                try:
+                    n = float(meta["series_index"])
+                    if n == int(n):
+                        idx_str = " " + str(int(n)).zfill(2)
+                    else:
+                        idx_str = " " + meta["series_index"]
+                except ValueError:
+                    idx_str = " " + meta["series_index"]
+            raw_title = f"{meta['series']}{idx_str} - {meta['title']}"
+
+    clean_title = normalize_filename(raw_title)
+
+    # fallback：原始檔名含更多系列資訊（GAS 步驟 3 fallback）
+    if orig_name:
+        base = re.sub(r"\.(epub|pdf|mobi|azw3?)$", "", orig_name, flags=re.I)
+        base = re.sub(r"\s*\([^)]*\)\s*$", "", base).strip()
+        orig_clean = normalize_filename(base)
+        if (orig_clean and clean_title
+                and clean_title.lower() in orig_clean.lower()
+                and len(orig_clean) > len(clean_title) * 1.5):
+            clean_title = orig_clean
+
+    new_name = build_filename(clean_title, clean_author, ext)
+    return clean_title, clean_author, new_name
+
+
 def is_pdf_truncated(pdf_bytes: bytes) -> bool:
     """檢查 PDF 末尾 2KB 有沒有 %%EOF / startxref。
 
@@ -262,6 +324,34 @@ def is_duplicate(all_data, title: str, author: str) -> bool:
     return False
 
 
+def _ensure_grid_rows(sheets_service, sid: str, needed_row: int):
+    """確保 ALL 分頁 grid 列數 >= needed_row；不足就 appendDimension 補（含 buffer）。
+
+    values().batchUpdate 寫超過 grid 範圍的 cell 會 400 'exceeds grid limits'
+    （不像 values().append 會自動擴格）。sheet 剛好被填滿時（如 4846/4846）補列。
+    """
+    meta = sheets_service.spreadsheets().get(
+        spreadsheetId=sid,
+        fields="sheets(properties(sheetId,title,gridProperties(rowCount)))",
+    ).execute()
+    sheet = next((s for s in meta.get("sheets", [])
+                  if s["properties"]["title"] == MAIN_SHEET), None)
+    if not sheet:
+        return
+    props = sheet["properties"]
+    row_count = props.get("gridProperties", {}).get("rowCount", 0)
+    if needed_row <= row_count:
+        return
+    add = (needed_row - row_count) + 100  # 一次多補 100 列當 buffer，少打 API
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=sid,
+        body={"requests": [{"appendDimension": {
+            "sheetId": props["sheetId"], "dimension": "ROWS", "length": add,
+        }}]},
+    ).execute()
+    logger.info(f"  ALL grid 補 {add} 列（{row_count} → {row_count + add}）")
+
+
 def append_to_all(sheets_service, sid: str, last_row: int, info: dict):
     """append 一列到 ALL。注意 Sheets API 用 USER_ENTERED 寫 URL 會自動變超連結。
 
@@ -269,6 +359,7 @@ def append_to_all(sheets_service, sid: str, last_row: int, info: dict):
     沒有就退回 Drive thumbnail（epub 用，後續會被 cover_drive 改寫成真封面）。
     """
     new_row = last_row + 1
+    _ensure_grid_rows(sheets_service, sid, new_row)
     # 一次寫多 cell 用 batchUpdate
     updates = [
         {"range": f"'{MAIN_SHEET}'!A{new_row}", "values": [[info["title"]]]},
@@ -393,50 +484,10 @@ def run():
                     stats["move_review_err"] += 1
             continue
 
-        # 簡轉繁（用 zhconv 純 Python）
-        try:
-            from zhconv import convert as zh_convert
-            if meta["title"]:
-                orig_t = meta["title"]
-                meta["title"] = zh_convert(orig_t, "zh-tw")
-                if orig_t != meta["title"]:
-                    logger.info(f"  🔁 title 簡→繁：{orig_t} → {meta['title']}")
-            if meta["author"]:
-                orig_a = meta["author"]
-                meta["author"] = zh_convert(orig_a, "zh-tw")
-                if orig_a != meta["author"]:
-                    logger.info(f"  🔁 author 簡→繁：{orig_a} → {meta['author']}")
-            if meta.get("series"):
-                orig_s = meta["series"]
-                meta["series"] = zh_convert(orig_s, "zh-tw")
-                if orig_s != meta["series"]:
-                    logger.info(f"  🔁 series 簡→繁：{orig_s} → {meta['series']}")
-        except Exception as e:
-            logger.warning(f"  簡轉繁失敗（保留原文）：{e}")
-
-        raw_title = meta["title"]
-        clean_author = normalize_author(meta["author"])
-
-        # 系列拼接（GAS 邏輯）
-        if meta["series"]:
-            series_core = re.sub(r"\s+\d+(\.\d+)?$", "", meta["series"]).strip()
-            already_has = series_core.lower() in raw_title.lower()
-            if not already_has:
-                idx_str = ""
-                if meta["series_index"]:
-                    try:
-                        n = float(meta["series_index"])
-                        if n == int(n):
-                            idx_str = " " + str(int(n)).zfill(2)
-                        else:
-                            idx_str = " " + meta["series_index"]
-                    except ValueError:
-                        idx_str = " " + meta["series_index"]
-                raw_title = f"{meta['series']}{idx_str} - {meta['title']}"
-
-        clean_title = normalize_filename(raw_title)
+        # 簡轉繁（用 zhconv 純 Python）+ 組檔名（系列拼接 / normalize / 原始檔名 fallback）
+        simp_to_trad_meta(meta)
         ext = ".pdf" if kind == "pdf" else ".epub"
-        new_name = build_filename(clean_title, clean_author, ext)
+        clean_title, clean_author, new_name = derive_clean_name(meta, ext, orig_name)
 
         # 重複檢查
         is_dup = is_duplicate(all_data, clean_title, clean_author)

@@ -108,6 +108,11 @@ def job_picture_books():
     _run_task("picture_books", picture_books.run)
 
 
+def job_review_epub_processor():
+    from tasks import review_epub_processor
+    _run_task("review_epub_processor", review_epub_processor.run)
+
+
 def job_duplicate_detector():
     from tasks import duplicate_detector
     _run_task("duplicate_detector", duplicate_detector.run)
@@ -227,6 +232,14 @@ def register_schedules():
         os.environ.get("INBOX_PROCESSOR_AT_UTC", "08:30")  # 08:30 UTC = 16:30 TW
     ).do(job_inbox_processor)
 
+    # review_epub_processor：每日 09:00 UTC = 17:00 TW
+    #   接 GAS（16:00 epub）解不開、punt 到 eBookReading/_inbox/_review 的大 epub。
+    #   排在 GAS 16:00 與 Python pdf 16:30 之後，確保 GAS 已把大檔 punt 進 _review。
+    #   只收 _review 的 .epub；與 GAS（_inbox epub）/ inbox_processor（_inbox pdf）來源不重疊。
+    schedule.every().day.at(
+        os.environ.get("REVIEW_EPUB_AT_UTC", "09:00")
+    ).do(job_review_epub_processor)
+
     # folder_sync：每日 04:00 UTC = 每日 12:00 TW（Phase 3）
     schedule.every().day.at(
         os.environ.get("FOLDER_SYNC_AT_UTC", "04:00")
@@ -289,6 +302,7 @@ def main():
         job_cover_web()
         # auto_fill_links / health_dashboard 已搬回主帳號 GAS、Zeabur 不跑
         job_inbox_processor()  # 2026-05-27 重啟、只跑 PDF
+        job_review_epub_processor()  # 接 GAS 解不開 punt 到 _review 的大 epub
         job_folder_sync()
         job_drive_index()
         job_picture_books()
