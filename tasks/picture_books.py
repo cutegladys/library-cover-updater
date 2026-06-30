@@ -233,13 +233,19 @@ def book_verdict(file_name: str, title: str):
     return True, None
 
 
-def filter_orphans(orphans: list):
+def filter_orphans(orphans: list, known_folders=None):
     """
-    對 orphans 做兩層過濾（對齊 GAS _pbFilterOrphans）：
+    對 orphans 做三層過濾（對齊 GAS _pbFilterOrphans）：
       (1) 逐檔 book_verdict（副檔名白名單 + 音檔/影片/簡報關鍵字 + 課程碼 + 單元碼 + 亂碼 + 過短）。
-      (2) 同名（= 同系列/同資料夾，因草稿書名取資料夾名）只收第一筆代表。
+      (2) 系列收斂：葉夾為「有意義名」（非通用容器）且該資料夾已有任一 sibling 編目在 ALL →
+          整個資料夾視為已代表，不再當 orphan。修「多檔系列夾每次換 sibling 重複浮現」缺陷：
+          dedup 只留代表那筆，commit 只把代表的 fileId 寫進 ALL，其餘 sibling fileId 仍不在 ALL，
+          下次掃描 dedup 改挑另一個 sibling 當 rep → 同 title 又浮現一筆、永不收斂。
+          known_folders（= 已編目檔所在的有意義葉夾路徑集合）讓整夾一次定生死。
+      (3) 同名（= 同系列/同資料夾，因草稿書名取資料夾名）只收第一筆代表。
     @return (kept: list, rejected: dict{reason: count})
     """
+    known_folders = known_folders or set()
     kept = []
     rejected = {}
     seen_title = set()
@@ -252,6 +258,13 @@ def filter_orphans(orphans: list):
         ok, reason = book_verdict(o.get("name", ""), title)
         if not ok:
             rej(reason)
+            continue
+        # 系列已編目收斂：有意義葉夾（非通用容器）+ 該夾已有 sibling 在 ALL → 整夾已代表，不再浮現。
+        # 通用容器夾（Ebook/PDF/MP3…）書名退回檔名、每檔是各自獨立書、不可整夾跳過，故排除。
+        folder = o.get("path", "")
+        leaf = _leaf_folder(folder)
+        if leaf and leaf.lower() not in GENERIC_LEAF_FOLDERS and folder in known_folders:
+            rej("系列已編目（sibling 已在 ALL）")
             continue
         key = title.lower()
         if key in seen_title:
@@ -328,6 +341,19 @@ def run():
             known_fids.add(str(r[0]).strip())
     logger.info(f"[picture_books] ALL V 欄已有 fileId: {len(known_fids)}")
 
+    # 系列收斂用 known_folders：已編目檔（fileId ∈ known_fids）所在的「有意義葉夾」資料夾路徑集合。
+    # 多檔系列夾只 commit 代表那筆的 fileId，其餘 sibling fileId 仍不在 ALL；若只靠 known_fids 比對，
+    # 下次掃描會改挑另一個 sibling 當 rep → 同 title 重複浮現、永不收斂（2026-07-01 實測 13 本系列）。
+    # 對策：只要該資料夾已有任一 sibling 編目，整夾視為已代表（見 filter_orphans 第 (2) 層）。
+    # 通用容器葉夾（Ebook/PDF/MP3…）排除——書名退回檔名、每檔各自獨立書，不可整夾跳過。
+    known_folders = set()
+    for f in files:
+        if f["id"] in known_fids:
+            leaf = _leaf_folder(f.get("path", ""))
+            if leaf and leaf.lower() not in GENERIC_LEAF_FOLDERS:
+                known_folders.add(f.get("path", ""))
+    logger.info(f"[picture_books] 已編目系列資料夾（known_folders）: {len(known_folders)}")
+
     # 對齊 GAS _pbFindOrphans line 187-188：排除 _duplicates_quarantine 隔離資料夾
     # （dedup 工具放的重複檔、非真實新繪本、不該算 orphan）
     orphans = [
@@ -347,7 +373,7 @@ def run():
     # Drive 樹裝整套英文閱讀課程：孤兒裡多半是音檔/影片/簡報/課程碼/單元碼/亂碼/同名重複。
     # 只留「像繪本/讀本」的書檔，並對同名（=同系列/同資料夾）只收一筆代表。
     raw_orphan_count = len(orphans)
-    orphans, rejected = filter_orphans(orphans)
+    orphans, rejected = filter_orphans(orphans, known_folders)
     if rejected:
         rej_report = "；".join(
             f"{k}:{v}" for k, v in sorted(rejected.items(), key=lambda kv: -kv[1])
