@@ -18,6 +18,7 @@ env:
 """
 import logging
 import os
+import re
 from collections import Counter
 
 from googleapiclient.discovery import build
@@ -35,14 +36,25 @@ MAIN_SHEET = "ALL"
 ALL_COL_TITLE = 1
 ALL_COL_AUTHOR = 2
 ALL_COL_LANG = 3
+ALL_COL_CATEGORY = 5   # E（分類；依副檔名補「電子書」）
 ALL_COL_SOURCE = 6
 ALL_COL_STATUS = 7
+ALL_COL_NOTE = 9       # I（備註「原始檔名: …」＝書本不可變身分；folder_sync/dedup 靠它）
 ALL_COL_DRIVE_URL = 21
 ALL_COL_FILE_ID = 22
 ALL_TOTAL_COLS = 22
 
 SOURCE_VALUE = "Google Drive"
 STATUS_VALUE = "已擁有"
+
+# 書檔副檔名 → 電子書（對齊 picture_books.BOOK_EXTENSIONS / GAS _PB.BOOK_EXTENSIONS）
+BOOK_EXTENSIONS = {"pdf", "epub", "mobi", "azw3", "azw", "cbz", "cbr"}
+
+
+def _category_for_file(file_name: str) -> str:
+    """依副檔名判分類（書檔副檔名 → 電子書，其餘空）。"""
+    m = re.search(r"\.([A-Za-z0-9]+)$", str(file_name or ""))
+    return "電子書" if (m and m.group(1).lower() in BOOK_EXTENSIONS) else ""
 
 
 def run():
@@ -55,7 +67,7 @@ def run():
     # 讀 _PB_Draft 全部
     try:
         res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!A1:J",
+            spreadsheetId=sid, range=f"'{DRAFT_SHEET}'!A1:K",
             valueRenderOption="UNFORMATTED_VALUE",
         ).execute()
     except HttpError as e:
@@ -72,7 +84,7 @@ def run():
     rows_to_commit = []  # list of (draft_row_num, new_row_22cols)
 
     for i, row in enumerate(data[1:], start=2):  # start row 2 (skip header)
-        while len(row) < 10:
+        while len(row) < 11:
             row.append("")
         action = str(row[9] or "").strip().upper()
         if action != "APPROVED":
@@ -87,6 +99,7 @@ def run():
         file_id = str(row[5] or "").strip()
         url = str(row[6] or "").strip()
         folder_path = str(row[7] or "").strip()
+        orig_file_name = str(row[10] or "").strip()  # K: 原始檔名（新版 draft 才有）
 
         # 防衛 1：title / fileId 為空
         if not title or not file_id:
@@ -100,13 +113,19 @@ def run():
             stats["skipped_quarantine"] += 1
             continue
 
+        # 分類：優先用原始檔名副檔名；缺則退回書名（副檔名少見但保底）
+        category = _category_for_file(orig_file_name or title)
+
         # 組 ALL 的 22 欄 new row
         new_row = [""] * ALL_TOTAL_COLS
         new_row[ALL_COL_TITLE - 1] = title
         new_row[ALL_COL_AUTHOR - 1] = author
         new_row[ALL_COL_LANG - 1] = lang
+        new_row[ALL_COL_CATEGORY - 1] = category
         new_row[ALL_COL_SOURCE - 1] = source
         new_row[ALL_COL_STATUS - 1] = status_val
+        # I 欄「原始檔名: <含副檔名>」＝書本不可變身分；folder_sync 分歧守門 + dedup 靠它。
+        new_row[ALL_COL_NOTE - 1] = f"原始檔名: {orig_file_name}" if orig_file_name else ""
         new_row[ALL_COL_DRIVE_URL - 1] = url
         new_row[ALL_COL_FILE_ID - 1] = file_id
 

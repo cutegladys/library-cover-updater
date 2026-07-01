@@ -168,17 +168,21 @@ def _leaf_folder(path: str) -> str:
 
 def guess_title_from_structure(orphan: dict) -> str:
     """
-    用「資料夾/檔名」結構猜草稿書名（不下載、不 parse meta）。
-    - 葉資料夾名有意義（非通用容器名）→ 用葉資料夾名（一個系列共用一個書名，配合同名去重收一筆代表）。
-    - 葉資料夾是通用容器名（Ebook/PDF/MP3/cartoon…）或無資料夾 → 退回「檔名去副檔名」，
-      再過 normalize_filename 清廣告/出版社標籤/全形（對齊 inbox normalizer）。
-    與 GAS _pbWriteDraft / _pbFilterOrphans 的 title 計算一致；簡轉繁由 run() 統一處理。
+    猜草稿書名（不下載、不 parse meta）：**一律用每檔名 stem**
+    （去副檔名 + normalize_filename 清廣告/出版社標籤/全形，對齊 inbox normalizer）。
+
+    2026-07-01 根治：舊版對「有意義葉夾」回傳資料夾名 → 一個系列夾（Amelia Fang /
+      The Last Firehawk Series / Dragon Realm Series…）N 個不同書檔全拿同一資料夾名 →
+      被重複偵測器當「同名可自動合併」把不同集塌成一本。改成每檔各自獨立成可 review 草稿。
+    與 GAS _pbGuessTitle 一致；簡轉繁由 run() 統一處理。
     """
-    folder = _leaf_folder(orphan.get("path", "")).strip()
-    if folder and folder.lower() not in GENERIC_LEAF_FOLDERS:
-        return folder
     base = re.sub(r"\.[^.]+$", "", str(orphan.get("name", "")))
     return (normalize_filename(base) or base).strip()
+
+
+def category_for_file(file_name: str) -> str:
+    """依副檔名判分類（書檔副檔名 → 電子書，其餘空）。commit 時補 ALL E 欄。"""
+    return "電子書" if _file_ext(file_name) in BOOK_EXTENSIONS else ""
 
 
 def _mostly_garbled(s: str) -> bool:
@@ -235,17 +239,15 @@ def book_verdict(file_name: str, title: str):
 
 def filter_orphans(orphans: list, known_folders=None):
     """
-    對 orphans 做三層過濾（對齊 GAS _pbFilterOrphans）：
+    對 orphans 做兩層過濾（對齊 GAS _pbFilterOrphans）：
       (1) 逐檔 book_verdict（副檔名白名單 + 音檔/影片/簡報關鍵字 + 課程碼 + 單元碼 + 亂碼 + 過短）。
-      (2) 系列收斂：葉夾為「有意義名」（非通用容器）且該資料夾已有任一 sibling 編目在 ALL →
-          整個資料夾視為已代表，不再當 orphan。修「多檔系列夾每次換 sibling 重複浮現」缺陷：
-          dedup 只留代表那筆，commit 只把代表的 fileId 寫進 ALL，其餘 sibling fileId 仍不在 ALL，
-          下次掃描 dedup 改挑另一個 sibling 當 rep → 同 title 又浮現一筆、永不收斂。
-          known_folders（= 已編目檔所在的有意義葉夾路徑集合）讓整夾一次定生死。
-      (3) 同名（= 同系列/同資料夾，因草稿書名取資料夾名）只收第一筆代表。
+      (2) 同名去重（seen_title）：書名現在＝每檔名 stem，只擋「真同名檔」，不再是系列夾整夾塌縮。
+
+    2026-07-01 起：書名改用每檔名 stem（見 guess_title_from_structure），run() 的 known_fids
+      （fileId ∈ ALL 即跳過）本來就防重複浮現，故移除舊「系列已編目 known_folders 收斂」band-aid
+      （known_folders 參數保留只為簽章相容、不再使用）。
     @return (kept: list, rejected: dict{reason: count})
     """
-    known_folders = known_folders or set()
     kept = []
     rejected = {}
     seen_title = set()
@@ -258,13 +260,6 @@ def filter_orphans(orphans: list, known_folders=None):
         ok, reason = book_verdict(o.get("name", ""), title)
         if not ok:
             rej(reason)
-            continue
-        # 系列已編目收斂：有意義葉夾（非通用容器）+ 該夾已有 sibling 在 ALL → 整夾已代表，不再浮現。
-        # 通用容器夾（Ebook/PDF/MP3…）書名退回檔名、每檔是各自獨立書、不可整夾跳過，故排除。
-        folder = o.get("path", "")
-        leaf = _leaf_folder(folder)
-        if leaf and leaf.lower() not in GENERIC_LEAF_FOLDERS and folder in known_folders:
-            rej("系列已編目（sibling 已在 ALL）")
             continue
         key = title.lower()
         if key in seen_title:
@@ -341,18 +336,8 @@ def run():
             known_fids.add(str(r[0]).strip())
     logger.info(f"[picture_books] ALL V 欄已有 fileId: {len(known_fids)}")
 
-    # 系列收斂用 known_folders：已編目檔（fileId ∈ known_fids）所在的「有意義葉夾」資料夾路徑集合。
-    # 多檔系列夾只 commit 代表那筆的 fileId，其餘 sibling fileId 仍不在 ALL；若只靠 known_fids 比對，
-    # 下次掃描會改挑另一個 sibling 當 rep → 同 title 重複浮現、永不收斂（2026-07-01 實測 13 本系列）。
-    # 對策：只要該資料夾已有任一 sibling 編目，整夾視為已代表（見 filter_orphans 第 (2) 層）。
-    # 通用容器葉夾（Ebook/PDF/MP3…）排除——書名退回檔名、每檔各自獨立書，不可整夾跳過。
-    known_folders = set()
-    for f in files:
-        if f["id"] in known_fids:
-            leaf = _leaf_folder(f.get("path", ""))
-            if leaf and leaf.lower() not in GENERIC_LEAF_FOLDERS:
-                known_folders.add(f.get("path", ""))
-    logger.info(f"[picture_books] 已編目系列資料夾（known_folders）: {len(known_folders)}")
+    # 2026-07-01 起：書名改用每檔名 stem，known_fids（fileId ∈ ALL 即跳過）本來就防重複浮現，
+    # 舊「系列已編目 known_folders 收斂」band-aid 已移除（見 filter_orphans）。
 
     # 對齊 GAS _pbFindOrphans line 187-188：排除 _duplicates_quarantine 隔離資料夾
     # （dedup 工具放的重複檔、非真實新繪本、不該算 orphan）
@@ -373,7 +358,7 @@ def run():
     # Drive 樹裝整套英文閱讀課程：孤兒裡多半是音檔/影片/簡報/課程碼/單元碼/亂碼/同名重複。
     # 只留「像繪本/讀本」的書檔，並對同名（=同系列/同資料夾）只收一筆代表。
     raw_orphan_count = len(orphans)
-    orphans, rejected = filter_orphans(orphans, known_folders)
+    orphans, rejected = filter_orphans(orphans)
     if rejected:
         rej_report = "；".join(
             f"{k}:{v}" for k, v in sorted(rejected.items(), key=lambda kv: -kv[1])
@@ -394,8 +379,10 @@ def run():
     ensure_draft_sheet(sheets_service, sid, dry_run)
 
     # _PB_Draft schema（對齊 GAS）：
-    # A 書名(草稿) | B 作者(草稿) | C 語言 | D 來源 | E 狀態 | F FileId | G Drive URL | H 資料夾路徑 | I 建立時間 | J 操作
-    rows = [["書名(草稿)", "作者(草稿)", "語言", "來源", "狀態", "FileId", "Drive URL", "資料夾路徑", "建立時間", "操作"]]
+    # A 書名(草稿) | B 作者(草稿) | C 語言 | D 來源 | E 狀態 | F FileId | G Drive URL | H 資料夾路徑 | I 建立時間 | J 操作 | K 原始檔名
+    # K（尾欄，2026-07-01 加）= 原始檔名：commit 寫進 ALL I 欄「原始檔名: …」（書本不可變身分）。
+    # 為尾欄、不插中間欄 → pb-review skill / pb_commit 既有 index 0-9 不受影響。
+    rows = [["書名(草稿)", "作者(草稿)", "語言", "來源", "狀態", "FileId", "Drive URL", "資料夾路徑", "建立時間", "操作", "原始檔名"]]
 
     s2t_changed = 0
     for o in orphans:
@@ -416,6 +403,7 @@ def run():
             o["path"][:200],
             ts,
             "PENDING",
+            o["name"],  # K: 原始檔名（含副檔名）→ commit 寫 ALL I 欄
         ])
 
     if s2t_changed > 0:
