@@ -4,6 +4,8 @@ import os
 
 import requests
 
+from utils.push_targets import get_push_target, push_target_allows
+
 logger = logging.getLogger("library_cover_updater")
 
 
@@ -53,21 +55,29 @@ def notify_success(message: str) -> bool:
     return notify(message, force=False)
 
 
-def notify_with_buttons(message: str, buttons: list) -> bool:
+def notify_with_buttons(message: str, buttons: list, type_key: str = "duplicate_detector") -> bool:
     """
     發 Telegram 訊息含 inline_keyboard buttons（強制發、不受 error_only 影響）。
     buttons: list of list of {text, callback_data}
     e.g. [[{"text": "✅ 批准合併", "callback_data": "lib_merge_now"}, {"text": "❌ 略過", "callback_data": "lib_merge_skip"}]]
 
-    LINE：若設了 LINE_CHANNEL_ACCESS_TOKEN + LINE_PUSH_USER_ID（Library 頻道），額外推一張
-    Flex 按鈕卡（best-effort，與 TG 同款按鈕）。merge_book/force_merge_book/ignore_book 的 postback
-    由 Library GAS lineWebhook 通用合成 callback_query 路由到既有 merge handler；候選資料在
-    _DupCandidates 分頁（全域、不分平台），合併結果經 guard 回 LINE。未設 env 則安全略過。
+    平台由中央控制台 PushTargets `library/<type_key>` 決定（both|tg|line|off）；
+    讀表失敗 / 無 token 時 fallback=both（＝現況，不改變既有行為）。改平台請編
+    GladysMemo › PushTargets，不改本程式。
+
+    LINE：target 允許 line 且設了 LINE_CHANNEL_ACCESS_TOKEN + LINE_PUSH_USER_ID（Library 頻道）
+    時，額外推一張 Flex 按鈕卡（與 TG 同款按鈕）。merge_book/force_merge_book/ignore_book 的
+    postback 由 Library GAS lineWebhook 通用合成 callback_query 路由到既有 merge handler；候選資料
+    在 _DupCandidates 分頁（全域、不分平台），合併結果經 guard 回 LINE。
     """
+    target = get_push_target("library", type_key, fallback="both")
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     ok = False
-    if token and chat_id:
+    if not push_target_allows(target, "telegram"):
+        logger.info(f"[push target={target}] 略過 TG（library/{type_key}）")
+    elif token and chat_id:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
             resp = requests.post(
@@ -88,8 +98,11 @@ def notify_with_buttons(message: str, buttons: list) -> bool:
     else:
         logger.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 未設定，跳過 TG 通知")
 
-    # LINE leg（best-effort，不影響 TG 結果）
-    _push_line_flex_buttons(message, buttons)
+    # LINE leg（best-effort，不影響 TG 結果）；target 允許才推
+    if push_target_allows(target, "line"):
+        _push_line_flex_buttons(message, buttons)
+    else:
+        logger.info(f"[push target={target}] 略過 LINE（library/{type_key}）")
     return ok
 
 
