@@ -22,6 +22,12 @@ def notify(message: str, *, force: bool = False) -> bool:
         logger.info(f"[notify suppressed, error_only mode] {message[:100]}")
         return True
 
+    # 平台由中央控制台 PushTargets library/cover_updater_ops 決定；讀表失敗 fallback=tg（現況）。
+    # 這是 task 成功/失敗摘要（多為失敗告警，§七17）：預設 tg、建議保持開。
+    if not push_target_allows(get_push_target("library", "cover_updater_ops", fallback="tg"), "telegram"):
+        logger.info("[PushTargets library/cover_updater_ops] 非 tg，略過 notify TG 推播")
+        return True
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
