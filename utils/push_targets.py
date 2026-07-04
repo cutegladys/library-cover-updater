@@ -22,10 +22,7 @@ import urllib.request
 _SHEET_ID = "1Z33wzgTMCkasAM6TcZ__0aPy1-p2rJmK3lw3FNlBpyQ"  # GladysMemo
 _TAB = "PushTargets"
 # ClaudeAPI Web App（跑在 Gladys 帳號＝Sheet owner，免分享 SA）；同 jp/fitness push_targets.py。
-_CLAUDE_API_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbw9xug8rB5lu242Yx-zgo-BFjosjFEiVUgaYiPr7ZIGULboZVsmknl5vBGrLrJyF_3MGQ/exec"
-)
+_CLAUDE_API_URL = os.getenv("CLAUDE_API_URL", "").strip()  # 收斂單一切換點（見 CLAUDE.md §一）；未設→_load_map graceful 回 fallback
 _CACHE_SEC = 300
 
 _cache: dict | None = None
@@ -43,7 +40,7 @@ def _load_map() -> dict | None:
     if _cache is not None and (now - _cache_ts) < _CACHE_SEC:
         return _cache
     token = _token()
-    if not token:
+    if not _CLAUDE_API_URL or not token:
         return None  # 無 token → fallback（不改變既有行為）
     try:
         body = json.dumps({
