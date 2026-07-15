@@ -79,9 +79,23 @@ def run():
     if len(data) < 2:
         return {"task": "pb_commit", "targets": 0, "note": "no_rows"}
 
+    # FileId is the idempotency key. A recovered/stale draft must never
+    # resurrect a catalog row that is already present in ALL.
+    existing_file_ids = {
+        str(row[0]).strip()
+        for row in sheets_service.spreadsheets().values().get(
+            spreadsheetId=sid,
+            range=f"'{MAIN_SHEET}'!V2:V",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute().get("values", [])
+        if row and str(row[0]).strip()
+    }
+    batch_file_ids = set()
+
     # 找 APPROVED 列
     stats = Counter()
     rows_to_commit = []  # list of (draft_row_num, new_row_22cols)
+    already_present_rows = []
 
     for i, row in enumerate(data[1:], start=2):  # start row 2 (skip header)
         while len(row) < 11:
@@ -113,6 +127,13 @@ def run():
             stats["skipped_quarantine"] += 1
             continue
 
+        if file_id in existing_file_ids or file_id in batch_file_ids:
+            logger.info(f"  row {i}：fileId 已在 ALL／本批次，標記 COMMITTED、不再 append")
+            stats["skipped_existing_file_id"] += 1
+            already_present_rows.append(i)
+            continue
+        batch_file_ids.add(file_id)
+
         # 分類：優先用原始檔名副檔名；缺則退回書名（副檔名少見但保底）
         category = _category_for_file(orig_file_name or title)
 
@@ -135,8 +156,27 @@ def run():
     stats["approved_found"] = committed
 
     if committed == 0:
+        if already_present_rows and not dry_run:
+            sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=sid,
+                body={
+                    "valueInputOption": "RAW",
+                    "data": [
+                        {
+                            "range": f"'{DRAFT_SHEET}'!J{row_num}",
+                            "values": [["COMMITTED"]],
+                        }
+                        for row_num in already_present_rows
+                    ],
+                },
+            ).execute()
         logger.info(f"[pb_commit] 無 APPROVED 列、跳過。stats={dict(stats)}")
-        return {"task": "pb_commit", "targets": 0, "note": "no_approved", "stats": dict(stats)}
+        return {
+            "task": "pb_commit",
+            "targets": 0,
+            "note": "already_present" if already_present_rows else "no_approved",
+            "stats": dict(stats),
+        }
 
     logger.info(f"[pb_commit] 找到 {committed} 個 APPROVED 列、準備 commit 到 ALL (dry_run={dry_run})")
 
@@ -157,6 +197,11 @@ def run():
 
     # 2. 把 _PB_Draft 對應列 J 欄改 COMMITTED（一次性 batchUpdate）
     updates = []
+    for draft_row_num in already_present_rows:
+        updates.append({
+            "range": f"'{DRAFT_SHEET}'!J{draft_row_num}",
+            "values": [["COMMITTED"]],
+        })
     for draft_row_num, _ in rows_to_commit:
         updates.append({
             "range": f"'{DRAFT_SHEET}'!J{draft_row_num}",

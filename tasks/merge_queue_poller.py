@@ -139,6 +139,18 @@ def run():
         return {"task": "merge_queue_poller", "targets": 0, "note": "no_pending"}
 
     is_force = status == "pending_force"
+    if is_force:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        write_queue_status(sheets_service, sid, f"rejected_unsafe_force_{ts}")
+        notify_error(
+            "Library global force merge is disabled: same title/author does not "
+            "prove identical files. Review MANUAL groups individually."
+        )
+        return {
+            "task": "merge_queue_poller",
+            "targets": 0,
+            "note": "unsafe_force_rejected",
+        }
     logger.info(f"[merge_queue_poller] queue={status}，觸發 duplicate_merger LIVE_MERGE=true{' FORCE_MERGE=true' if is_force else ''}")
 
     # 暫時設 env 確保 merger LIVE（及可選 FORCE）

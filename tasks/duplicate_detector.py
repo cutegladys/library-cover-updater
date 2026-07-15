@@ -25,6 +25,7 @@ from googleapiclient.errors import HttpError
 from utils.oauth import load_creds
 from utils.sheets import sheet_id
 from utils.notify import notify_error, notify_with_buttons
+from tasks.duplicate_safety import assess_groups, fetch_drive_metadata
 
 logger = logging.getLogger("library_cover_updater.duplicate_detector")
 
@@ -44,7 +45,7 @@ def ensure_sheet(sheets_service, spreadsheet_id, name, dry_run):
     ).execute()
 
 
-def scan_duplicate_groups(all_data):
+def _legacy_scan_duplicate_groups(all_data):
     """
     對應 _scanDuplicateGroups。
     all_data: list of row data，index 0 起，row_number 從 2 開始（跳標題）。
@@ -151,6 +152,48 @@ def scan_duplicate_groups(all_data):
     }
 
 
+def collect_duplicate_groups(all_data):
+    """Collect every repeated title once; author equality is not identity."""
+    title_groups = defaultdict(
+        lambda: {"title": "", "rows": [], "row_numbers": []}
+    )
+    for index, row in enumerate(all_data):
+        row_number = index + 2
+        title = str(row[0]).strip() if row else ""
+        if not title:
+            continue
+        group = title_groups[title.lower()]
+        if not group["title"]:
+            group["title"] = title
+        group["rows"].append(row)
+        group["row_numbers"].append(row_number)
+
+    groups = []
+    for group in title_groups.values():
+        if len(group["rows"]) < 2:
+            continue
+        authors = [
+            str(row[1]).strip() if len(row) > 1 else ""
+            for row in group["rows"]
+        ]
+        unique_authors = sorted({author for author in authors if author})
+        groups.append(
+            {
+                **group,
+                "type": "title",
+                "author": unique_authors[0] if len(unique_authors) == 1 else "",
+                "authors": authors,
+                "unique_authors": unique_authors,
+            }
+        )
+    return groups
+
+
+def scan_duplicate_groups(all_data, file_meta=None):
+    """Fail closed: without Drive evidence, no title-only group is AUTO."""
+    return assess_groups(collect_duplicate_groups(all_data), file_meta or {})
+
+
 def run():
     dry_run = os.environ.get("COVER_UPDATER_DRY_RUN", "").lower() in ("1", "true", "yes")
 
@@ -160,41 +203,50 @@ def run():
 
     logger.info("[duplicate_detector] 讀 ALL 分頁...")
     res = sheets_service.spreadsheets().values().get(
-        spreadsheetId=sid, range="'ALL'!A2:I",
+        spreadsheetId=sid, range="'ALL'!A2:V",
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     all_data = res.get("values", [])
     logger.info(f"[duplicate_detector] ALL 行數: {len(all_data)}")
 
-    groups = scan_duplicate_groups(all_data)
+    candidates = collect_duplicate_groups(all_data)
+    drive_service = build("drive", "v3", credentials=creds)
+    file_meta = fetch_drive_metadata(drive_service, candidates)
+    groups = assess_groups(candidates, file_meta)
     auto_count = len(groups["auto_mergeable"])
     manual_count = len(groups["manual_review"])
     logger.info(f"[duplicate_detector] auto_mergeable: {auto_count}, manual_review: {manual_count}")
 
+    # _DupCandidates is a derived view, including the empty result.
+    ensure_sheet(sheets_service, sid, CANDIDATES_SHEET, dry_run)
+
     if auto_count == 0 and manual_count == 0:
+        if not dry_run:
+            sheets_service.spreadsheets().values().clear(
+                spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!A2:F",
+            ).execute()
         return {"task": "duplicate_detector", "targets": 0, "note": "no_duplicates"}
 
     # 寫 _DupCandidates 分頁
-    ensure_sheet(sheets_service, sid, CANDIDATES_SHEET, dry_run)
 
     rows = [["Group", "Type", "Title", "Author(s)", "Row Numbers", "Action"]]
     for i, g in enumerate(groups["auto_mergeable"], 1):
         rows.append([
             f"AUTO-{i}",
-            "title+author 同",
+            f"AUTO_SAFE：{g['safety_class']}",
             g["title"][:100],
-            g.get("author", "")[:80],
+            " | ".join(g.get("unique_authors", []))[:200],
             ", ".join(str(n) for n in g["row_numbers"]),
-            "set LIVE_MERGE=true 自動合併",
+            "批准後 LIVE 合併；merger 會重驗 Drive 證據",
         ])
     for i, g in enumerate(groups["manual_review"], 1):
         rows.append([
             f"MANUAL-{i}",
-            "title 同/author 不同",
+            f"MANUAL_REVIEW：{g['safety_class']}",
             g["title"][:100],
             " | ".join(g.get("unique_authors", []))[:200],
             ", ".join(str(n) for n in g["row_numbers"]),
-            "人工 review、決定 master row",
+            "逐組驗 fileId／MD5／版本／媒體；不可全域強制合併",
         ])
 
     # ⚠️ Reconcile 邏輯（保留 user 標記 + 自動清理已合併 / 已處理 group）
@@ -260,7 +312,7 @@ def run():
 
     logger.info(f"[duplicate_detector] 計畫：append {len(new_rows)} 列、刪 {len(rows_to_delete)} 列已處理")
 
-    if not dry_run:
+    if False and not dry_run:  # legacy reconcile disabled; full rebuild below is authoritative
         if rows_to_delete:
             meta = sheets_service.spreadsheets().get(spreadsheetId=sid).execute()
             dup_sheet_id = next((s["properties"]["sheetId"] for s in meta["sheets"]
@@ -317,14 +369,27 @@ def run():
         except Exception as e:
             logger.warning(f"[duplicate_detector] Group 編號 reconcile 失敗（不影響合併）：{e}")
 
+    # _DupCandidates is a derived view. Rebuild it from current evidence so an
+    # old title+author verdict can never survive a safer detector run.
+    if not dry_run:
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=sid, range=f"'{CANDIDATES_SHEET}'!A:F",
+        ).execute()
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=sid,
+            range=f"'{CANDIDATES_SHEET}'!A1:F{len(rows)}",
+            valueInputOption="RAW",
+            body={"values": rows},
+        ).execute()
+
     # 通知含 inline button（D2 Telegram bridge）
     summary = (
         f"📋 Library 重複偵測完成\n"
-        f"  auto_mergeable: {auto_count} 組（同 title+author）\n"
-        f"  manual_review: {manual_count} 組（title 同/author 不同）\n\n"
+        f"  auto_mergeable: {auto_count} 組（同 fileId／同非空 MD5）\n"
+        f"  manual_review: {manual_count} 組（同書名，但檔案身分未證明相同）\n\n"
         f"請先查看 _DupCandidates 分頁 review。\n"
-        f"點 ✅ 批准 → Zeabur 5 分鐘內自動合併 AUTO-* 組（merger 跑時也是 DRY_RUN 預設、實際合併要再 redeploy 設 LIVE_MERGE=true）。\n"
-        f"或請 user 直接到 Zeabur dashboard 設 LIVE_MERGE=true Redeploy 強制 live。"
+        f"點 ✅ 批准後，Zeabur 5 分鐘內會 LIVE 合併 AUTO-*；刪列前會再次查 Drive 證據。\n"
+        f"MANUAL-* 不提供全域強制合併。"
     )
     if auto_count > 0:
         notify_with_buttons(summary, [[
@@ -334,23 +399,21 @@ def run():
     else:
         notify_error(summary)
 
-    # manual_review 額外獨立通知（含 top 10 sample、強制合併 button）
-    # 對應 GAS scanForDuplicateBooks.js force_merge_book 邏輯（簡化版：global 強制合併、不分 per-book）
+    # manual_review 額外獨立通知；刻意不提供 global force merge。
     if manual_count > 0:
-        sample_lines = [f"⚠️ Library 有 {manual_count} 組「title 同/author 不同」需要人工 review："]
+        sample_lines = [f"⚠️ Library 有 {manual_count} 組同書名候選需要人工 review："]
         for i, g in enumerate(groups["manual_review"][:10], 1):
             authors_str = " | ".join(g.get("unique_authors", []))[:80]
-            sample_lines.append(f"  {i}. 《{g['title'][:40]}》 → {authors_str}")
+            sample_lines.append(
+                f"  {i}. 《{g['title'][:40]}》 → {g['safety_class']} | {authors_str}"
+            )
         if manual_count > 10:
             sample_lines.append(f"  ...另 {manual_count - 10} 組")
         sample_lines.append("")
-        sample_lines.append("如要強制合併（不考慮 author 差異）→ 點 🔀；否則略過讓我手動處理。")
+        sample_lines.append("請逐組驗 fileId／MD5／版本／媒體；禁止全域強制合併。")
         manual_msg = "\n".join(sample_lines)
         try:
-            notify_with_buttons(manual_msg, [[
-                {"text": "🔀 強制合併（忽略 author）", "callback_data": "lib_force_merge_now"},
-                {"text": "❌ 略過", "callback_data": "lib_merge_skip"},
-            ]])
+            notify_error(manual_msg)
         except Exception as e:
             logger.warning(f"  manual_review 通知失敗：{e}")
 

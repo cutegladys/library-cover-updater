@@ -24,6 +24,9 @@ env:
 import json
 import logging
 import os
+import random
+import socket
+import ssl
 import time
 from collections import Counter
 
@@ -33,7 +36,13 @@ from googleapiclient.errors import HttpError
 from utils.oauth import load_creds
 from utils.sheets import sheet_id
 from utils.notify import notify_error
-from tasks.duplicate_detector import scan_duplicate_groups
+from tasks.duplicate_detector import collect_duplicate_groups
+from tasks.duplicate_safety import (
+    assess_groups,
+    choose_master,
+    fetch_drive_metadata,
+    file_id_from_row,
+)
 
 logger = logging.getLogger("library_cover_updater.duplicate_merger")
 
@@ -45,6 +54,206 @@ SAFETY_CELL = f"'{AUDIT_SHEET}'!Z1"
 # 對應 sheetConfig.js MERGE_INDICES (0-based) = [1,2,3,4,5,6,7]，NOTE_INDEX=8
 MERGE_INDICES = [1, 2, 3, 4, 5, 6, 7]
 NOTE_INDEX = 8
+
+_RETRYABLE_STATUSES = (409, 429, 500, 502, 503, 504)
+
+
+def _execute_with_retry(request_factory, *, label, retry_times=5, retry_delay=5.0):
+    """Execute a Sheets request with a fresh request object on every retry."""
+    last_exc = None
+    for attempt in range(retry_times + 1):
+        try:
+            return request_factory().execute()
+        except HttpError as exc:
+            last_exc = exc
+            if exc.resp.status not in _RETRYABLE_STATUSES:
+                raise
+        except (socket.timeout, TimeoutError, ssl.SSLError, ConnectionError, OSError) as exc:
+            last_exc = exc
+
+        if attempt >= retry_times:
+            break
+        sleep_s = min(60.0, retry_delay * (2 ** attempt)) + random.uniform(0, 0.5)
+        logger.warning(
+            "[duplicate_merger] %s transient error; retry %s/%s after %.1fs",
+            label,
+            attempt + 1,
+            retry_times,
+            sleep_s,
+        )
+        time.sleep(sleep_s)
+    raise last_exc
+
+
+def _prepare_group(dup_group):
+    """Validate and calculate one merge without writing to Sheets."""
+    items = sorted(
+        zip(dup_group["row_numbers"], dup_group["rows"]),
+        key=lambda item: item[0],
+    )
+    preferred_master_row = dup_group.get("preferred_master_row")
+    if preferred_master_row is None:
+        primary_row, primary_data = items[0]
+    else:
+        primary_row, primary_data = next(
+            item for item in items if item[0] == preferred_master_row
+        )
+    primary_title = str(primary_data[0]).strip().lower()
+
+    invalid = []
+    for row_num, data in items:
+        if row_num == primary_row:
+            continue
+        cur_title = str(data[0]).strip().lower()
+        if cur_title != primary_title:
+            invalid.append(
+                {"row": row_num, "expected": primary_data[0], "actual": data[0]}
+            )
+    if invalid:
+        return {"success": False, "message": f"title mismatch: {invalid}"}
+
+    merged_data = list(primary_data)
+    for row_num, row_data in items:
+        if row_num == primary_row:
+            continue
+        for idx in MERGE_INDICES:
+            if idx >= len(merged_data):
+                continue
+            if not str(merged_data[idx] if idx < len(merged_data) else "").strip():
+                if idx < len(row_data) and row_data[idx]:
+                    merged_data[idx] = row_data[idx]
+        if NOTE_INDEX < len(merged_data) or NOTE_INDEX < len(row_data):
+            existing = str(
+                merged_data[NOTE_INDEX] if NOTE_INDEX < len(merged_data) else ""
+            ).strip()
+            incoming = str(
+                row_data[NOTE_INDEX] if NOTE_INDEX < len(row_data) else ""
+            ).strip()
+            if incoming and incoming not in existing:
+                while len(merged_data) <= NOTE_INDEX:
+                    merged_data.append("")
+                merged_data[NOTE_INDEX] = (
+                    f"{existing}；{incoming}" if existing else incoming
+                )
+
+    return {
+        "success": True,
+        "mergedRow": primary_row,
+        "deletedCount": len(items) - 1,
+        "merged_data": merged_data,
+        "items_to_delete": [item for item in items if item[0] != primary_row],
+        "row_numbers_to_delete": [
+            row_num for row_num, _ in items if row_num != primary_row
+        ],
+    }
+
+
+def merge_groups_batch(sheets_service, sid, all_sheet_id, groups):
+    """Merge many groups with three write requests, independent of group count."""
+    results = [_prepare_group(group) for group in groups]
+    valid_results = [result for result in results if result["success"]]
+    if not valid_results:
+        return results
+
+    # Re-read deletion targets immediately before any write. Candidate row
+    # numbers are not trusted across concurrent Sheet edits.
+    expected_rows = []
+    for group in groups:
+        for row_number, row in zip(group["row_numbers"], group["rows"]):
+            file_id = file_id_from_row(row)
+            if file_id:
+                expected_rows.append(
+                    (row_number, str(row[0]).strip().lower(), file_id)
+                )
+    if expected_rows:
+        live = _execute_with_retry(
+            lambda: sheets_service.spreadsheets().values().batchGet(
+                spreadsheetId=sid,
+                ranges=[
+                    f"'{MAIN_SHEET}'!A{row_number}:V{row_number}"
+                    for row_number, _, _ in expected_rows
+                ],
+                valueRenderOption="UNFORMATTED_VALUE",
+            ),
+            label="pre-delete row verification",
+        ).get("valueRanges", [])
+        if len(live) != len(expected_rows):
+            raise RuntimeError("pre-delete verification returned incomplete rows")
+        for expected, value_range in zip(expected_rows, live):
+            values = value_range.get("values", [])
+            row = values[0] if values else []
+            actual = (
+                str(row[0]).strip().lower() if row else "",
+                file_id_from_row(row),
+            )
+            if actual != expected[1:]:
+                raise RuntimeError(
+                    f"row drift at ALL row {expected[0]}: "
+                    f"expected={expected[1:]}, actual={actual}"
+                )
+
+    master_updates = [
+        {
+            "range": f"'{MAIN_SHEET}'!A{result['mergedRow']}",
+            "values": [result["merged_data"]],
+        }
+        for result in valid_results
+    ]
+    _execute_with_retry(
+        lambda: sheets_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sid,
+            body={"valueInputOption": "USER_ENTERED", "data": master_updates},
+        ),
+        label="batch master update",
+    )
+
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    backup_rows = []
+    for result in valid_results:
+        for row_num, data in result["items_to_delete"]:
+            title = str(data[0]) if data else ""
+            backup_rows.append(
+                [now_str, row_num, result["mergedRow"], title] + list(data)
+            )
+    _execute_with_retry(
+        lambda: sheets_service.spreadsheets().values().append(
+            spreadsheetId=sid,
+            range=f"'{BACKUP_SHEET}'!A1",
+            valueInputOption="RAW",
+            body={"values": backup_rows},
+        ),
+        label="batch deleted-row backup",
+    )
+
+    rows_to_delete = sorted(
+        {
+            row_num
+            for result in valid_results
+            for row_num in result["row_numbers_to_delete"]
+        },
+        reverse=True,
+    )
+    delete_requests = [
+        {
+            "deleteDimension": {
+                "range": {
+                    "sheetId": all_sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": row_num - 1,
+                    "endIndex": row_num,
+                }
+            }
+        }
+        for row_num in rows_to_delete
+    ]
+    _execute_with_retry(
+        lambda: sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": delete_requests},
+        ),
+        label="batch row deletion",
+    )
+    return results
 
 
 def ensure_sheet(sheets_service, spreadsheet_id, name):
@@ -224,23 +433,43 @@ def run():
         notify_error(msg)
         return {"task": "duplicate_merger", "targets": 0, "note": "no_progress_cap", "stats": dict(state)}
 
+    if force_merge:
+        msg = (
+            "Library merger rejected FORCE_MERGE: title/author is not deletion "
+            "evidence. Review MANUAL groups individually."
+        )
+        logger.warning("[duplicate_merger] %s", msg)
+        notify_error(msg)
+        return {
+            "task": "duplicate_merger",
+            "targets": 0,
+            "note": "unsafe_force_rejected",
+            "stats": dict(state),
+        }
+
     state["attempts_today"] = state.get("attempts_today", 0) + 1
 
     # 重跑 detector 拿最新 auto_mergeable groups（避免 stale candidates）
     logger.info("[duplicate_merger] 重跑 detector 拿最新 groups...")
     res = sheets_service.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"'{MAIN_SHEET}'!A2:I",
+        spreadsheetId=sid, range=f"'{MAIN_SHEET}'!A2:V",
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     all_data = res.get("values", [])
-    groups = scan_duplicate_groups(all_data)
+    candidates = collect_duplicate_groups(all_data)
+    drive_service = build("drive", "v3", credentials=creds)
+    file_meta = fetch_drive_metadata(drive_service, candidates)
+    groups = assess_groups(candidates, file_meta)
     auto_groups = list(groups["auto_mergeable"])
-    if force_merge:
+    if force_merge:  # unreachable: rejected above; retained for old audit compatibility
         # manual_review 也納入（同 title 不同 author、master 取最小 row、其他刪）
         # safety check 跑 merge_one_group 時會以 master title 對比；既然 title.lower 都相同、會通過。
         forced = groups["manual_review"]
         logger.info(f"[duplicate_merger] FORCE_MERGE=true、額外納入 {len(forced)} 組 manual_review")
         auto_groups.extend(forced)
+    for group in auto_groups:
+        master_row, _ = choose_master(group, file_meta)
+        group["preferred_master_row"] = master_row
     logger.info(f"[duplicate_merger] 待合併: {len(auto_groups)}, LIVE_MERGE={live_merge}, FORCE_MERGE={force_merge}, batch={batch_size}, attempts_today={state['attempts_today']}/{max_daily}")
 
     if not auto_groups:
@@ -289,11 +518,20 @@ def run():
     stats = Counter()
     start = time.time()
 
-    for i, g in enumerate(batch, 1):
+    if live_merge:
+        batch_results = merge_groups_batch(
+            sheets_service, sid, all_sheet_id, batch,
+        )
+    else:
+        batch_results = [
+            merge_one_group(sheets_service, sid, all_sheet_id, group, dry_run=True)
+            for group in batch
+        ]
+
+    for i, (g, result) in enumerate(zip(batch, batch_results), 1):
         title = g["title"][:80]
         row_nums = g["row_numbers"]
         try:
-            result = merge_one_group(sheets_service, sid, all_sheet_id, g, dry_run=not live_merge)
             if result["success"]:
                 stats["succeeded"] += 1
                 audit_rows.append([
