@@ -12,17 +12,20 @@
 預設 dry-run。設 env BACKFILL_APPLY=1 才真的寫 / 刪。
 真寫前會把整份 ALL!A:U 備份成 scripts/_backup_ALL_<ts>.json。
 
-只用主帳號 user OAuth(.env GOOGLE_USER_TOKEN_JSON 對應的 憑證 token)。
+讀取使用正式 runtime 的 Service Account；本腳本仍預設 dry-run。
 """
 import io, json, os, re, sys, time, datetime
 from collections import defaultdict, Counter
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from utils.oauth import load_sa_creds
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 APPLY = os.environ.get("BACKFILL_APPLY", "").lower() in ("1", "true", "yes")
 
@@ -38,12 +41,7 @@ with open(os.path.join(REPO, ".env"), encoding="utf-8") as f:
             v = v[1:-1]
         env[k] = v
 SHEET_ID = env["LIBRARY_SHEET_ID"]
-with open(os.path.join(REPO, "..", "憑證", "library-cover-user-token.json"), encoding="utf-8") as tf:
-    info = json.load(tf)
-creds = Credentials.from_authorized_user_info(
-    info, ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"])
-if creds.expired and creds.refresh_token:
-    creds.refresh(Request())
+creds = load_sa_creds(env.get("GOOGLE_SA_JSON", ""))
 sheets = build("sheets", "v4", credentials=creds)
 
 COL_TITLE, COL_NOTE, COL_MARKER, COL_LINK = 0, 8, 19, 20

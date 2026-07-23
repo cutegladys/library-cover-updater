@@ -27,7 +27,8 @@ Library 試算表新書封面自動補圖（Zeabur 排程，獨立容器）。
 
 | Key | 說明 |
 |---|---|
-| `GOOGLE_USER_TOKEN_JSON` | 主帳號 OAuth refresh token 整包 minified JSON。本機跑過 `Library/scripts/auth_setup.py` 後拿 `憑證/library-cover-user-token.json` 整檔 minify 成一行 |
+| `GOOGLE_SA_JSON` | Service Account JSON 或其 base64；只負責 Drive／Sheets 讀取 |
+| `RELAY_TOKEN` | MarukoRestrictedRelay owner-write token；不得寫入 Git |
 | `LIBRARY_SHEET_ID` | `1lb3M0z-aN0B1NpdPlQSFOPpoT94_Yo-ipsswDmAVuaQ` |
 | `COVER_ART_FOLDER_ID` | `1jSDRlKWWrQrYHw1XzOfTsJ1AIS7lgTbk` |
 | `TELEGRAM_BOT_TOKEN` | Bot Token（建議用既有 MainBot 或 SecretaryBot 的 token） |
@@ -58,7 +59,7 @@ Library 試算表新書封面自動補圖（Zeabur 排程，獨立容器）。
 1. 在 Zeabur 建新 service → 從 GitHub repo `cutegladys/library-cover-updater`、main branch
 2. **Health Check 關閉**（此 service 不監聽任何 port）
 3. Dockerfile 自動偵測（repo 根目錄有 `Dockerfile`）
-4. Variables 設上述環境變數（必填 5 個）
+4. Variables 設上述環境變數
 5. Deploy → 看 Logs：
    ```
    Library Cover Updater 啟動
@@ -68,24 +69,11 @@ Library 試算表新書封面自動補圖（Zeabur 排程，獨立容器）。
 
 ## 維護
 
-> ⚠ **2026-06-03 已遷移 SA + relay 混合身分**（commit `10f4ff6`，根治每週 OAuth 重簽）。現行：讀走 Service Account `n8n-178@`（env `GOOGLE_SA_JSON`，base64；`USE_SA_CREDS=1`）、寫走 MarukoRestrictedRelay（env `RELAY_TOKEN`）。**下面的 OAuth 重簽流程已降為 rollback only**（設 `USE_SA_CREDS` 非 1 才會用到 user-OAuth 讀路徑）。完整紀錄與 Step 6 收尾待辦見 `docs/plans/2026-06-03-sa-relay-migration.plan.md`。Step 6（移除 user-OAuth 死碼、整段改寫本維護段）約 2026-06-10 後做。
+> **身份邊界**：讀取固定走 Service Account；需要 owner 身分的建檔、搬檔、建夾與丟垃圾桶固定走 MarukoRestrictedRelay。不存在 user OAuth fallback，Variables 也不保留舊 OAuth token 或過渡切換開關。
 
-- **[rollback only] OAuth refresh token 失效（約每 7 天，`invalid_grant: Token has been expired or revoked`）**：本服務的 Desktop OAuth client 掛在標準專案 `linecalendarbot-475101`，該專案 OAuth 同意畫面在 **Testing 模式** → refresh token 每 7 天到期被 revoke（**不是**「半年-1 年的安全撤銷」；背景見根倉 memory `gas_default_vs_standard_gcp_project_restricted_scope` 與計畫書 `claudeapi-gmail-restricted-scope-fix-2026-05-31.plan.md`）。收到 Telegram「merge_queue_poller 異常：invalid_grant」時的 3 步復原（**全程 CLI，不必開 Zeabur 面板**）：
-  1. 本機重跑 `Library/scripts/auth_setup.py`（會開瀏覽器，**選主帳號 `cutegladys0708`** 同意，restricted 警告畫面按「進階→繼續」）→ 寫新 token 到 `憑證/library-cover-user-token.json`
-  2. 重新 minify 副本（不必重 OAuth，只要 full json 還活著）：
-     ```python
-     import json
-     i=json.load(open(r'E:\Dropbox\MarukoAutomation\憑證\library-cover-user-token.json',encoding='utf-8'))
-     open(r'E:\Dropbox\MarukoAutomation\憑證\zeabur-handover\google_user_token.minified.txt','w',encoding='utf-8',newline='').write(json.dumps(i,separators=(',',':'),ensure_ascii=False))
-     ```
-  3. 推進 Zeabur 並重啟（service id `6a0dd12733d1a635fa380313`；`variable update -k` 對含逗號的長 JSON 實測可完整存入，2026-06-03 驗證）：
-     ```bash
-     VAL=$(cat 憑證/zeabur-handover/google_user_token.minified.txt)
-     npx zeabur@latest variable update --id 6a0dd12733d1a635fa380313 -k "GOOGLE_USER_TOKEN_JSON=$VAL" -y -i=false
-     npx zeabur@latest service restart --id 6a0dd12733d1a635fa380313 -y
-     ```
-     重啟後等下一次 5 分鐘 poll，log 出現 `[merge_queue_poller] queue status: ... (skip)` 無 `invalid_grant` 即復原。
-  > ⚠ **不要為了省這週期把 `linecalendarbot-475101` 改成 Production**——會重新觸發 restricted Drive scope 的未驗證 runtime 牆（2026-05-31 relay 搬遷就是為了避開它）。Python/Zeabur 用 Desktop OAuth **無法**像 GAS 那樣靠免驗證預設專案規避（那是 GAS 專屬機制），走 relay 又會撞 30MB/6 分鐘上限，只能接受每週重簽 + Telegram 監看。
+- **Service Account 輪替**：在中央 SA inventory 建立 replacement key，先更新 `GOOGLE_SA_JSON`，等下一次自然 read-only poll 或 scheduled task 正向成功後才撤銷舊 key。任何 readback 只比較 `private_key_id`／name，不輸出 JSON。
+- **Relay token 輪替**：依中央 consumer denominator create-before-switch；本 repo 只讀 `RELAY_TOKEN`，不得硬編碼。
+- **身份錯誤**：缺 `GOOGLE_SA_JSON` 或 relay token時 fail closed；不要以 Desktop OAuth 重簽當作恢復手段。
 - **新書節奏改變**：若一週超過 200 本，調大 `MAX_ROWS_PER_RUN`，或改成週跑兩次
 - **每週一固定看一次 Telegram 通知**：確認週末有跑
 

@@ -14,7 +14,9 @@ Library Cover Updater — Zeabur entry point
 - picture_books / inbox_processor / auto_fill_links / health_dashboard (Phase 4)
 
 env 通用：
-  GOOGLE_USER_TOKEN_JSON    主帳號 OAuth refresh token (必填)
+  GOOGLE_SA_JSON            Service Account JSON 或其 base64（必填）
+  RELAY_URL                 MarukoRestrictedRelay 固定 URL（可選，有內建預設）
+  RELAY_TOKEN               owner-write relay token（必填）
   LIBRARY_SHEET_ID          Library 試算表 ID (必填)
   COVER_ART_FOLDER_ID       Cover Art 資料夾 ID (必填)
   TELEGRAM_BOT_TOKEN        通知 Bot Token (必填)
