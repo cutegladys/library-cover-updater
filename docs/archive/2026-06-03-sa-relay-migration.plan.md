@@ -1,9 +1,17 @@
 ---
 title: library-cover-updater 改 SA + relay 混合身分（根治每週重簽）
 type: 改善/重構
-status: 進行中（Step 1-5 完成並上線驗證；Step 6 收尾待穩定約一週 ~2026-06-10）
+status: done（Step 1-6完成；2026-07-24 current source/runtime正向驗收）
 created: 2026-06-03
+updated: 2026-07-24
 owner: Gladys
+completion: |
+  Step 6 commit `1fd8cc3b1ca3232f7ffe5277a3c38d1e9964f76a`移除user OAuth實作與dependency，
+  所有讀取固定使用`GOOGLE_SA_JSON`，owner-write維持relay；local unittest 11/11與compileall通過。
+  Zeabur current deployment `6a6248f89cfc4cd5e6899468`綁定exact commit並為RUNNING；
+  `merge_queue_poller`自然5分鐘輪次在source切換、移除`GOOGLE_USER_TOKEN_JSON`後皆正向讀取，
+  再移除`USE_SA_CREDS`後完成最終自然正向驗收。current name-only readback只保留
+  `GOOGLE_SA_JSON`與`RELAY_TOKEN`兩個必要能力；未手動觸發business task。
 todos:
   - "[relay] drive.js 新增 driveUpload(base64→建檔到指定夾+設公開讀→回 fileId)"
   - "[relay] drive.js 新增 driveMove(fileId+addParent+removeParent→搬檔)"
@@ -130,8 +138,8 @@ todos:
 
 **rollback**：Zeabur 移除/設 `USE_SA_CREDS` 非 1 → 立即切回舊 user-OAuth 讀路徑（寫仍走 relay，需 `RELAY_TOKEN`）。`GOOGLE_USER_TOKEN_JSON` 保留至 Step 6。
 
-**Step 6 待辦（穩定約一週 ~2026-06-10）**：移除 `load_user_creds` + `GOOGLE_USER_TOKEN_JSON` + `USE_SA_CREDS` 開關（預設改 SA）；README 維護段整段改寫（OAuth 重簽流程拔掉、改 SA+relay 架構＋SA 金鑰怎麼換）；memory `project_library_cover_updater_token_weekly_testing_expiry` 標記已根治。
+**Step 6 已完成（2026-07-24）**：移除 `load_user_creds`、`GOOGLE_USER_TOKEN_JSON`、`USE_SA_CREDS` 開關與 `google-auth-oauthlib` dependency；README 維護段已改為 SA+relay 架構與SA金鑰輪替流程。Zeabur先採用current source並等自然正向輪次，再依序移除兩個legacy rows，每一步都由下一個自然輪次驗證。
 
 **已知小副作用**：DRY_RUN 下 `cover_drive` 仍會上傳封面（只略過寫 sheet，既有行為），故 RUN_ON_START 測試在 Cover Art 留下少量未連結的孤兒封面 PNG（無害、下次真跑會建正式的）。
 
-**安全 follow-up**：遷移過程 Zeabur CLI 報錯把 n8n-178 私鑰印進 session 記錄（本機、.jsonl 不同步、風險低），穩定後建議輪替 n8n-178 金鑰（同步換 n8n credential + 此 `GOOGLE_SA_JSON`）。
+**Exposure disposition（依current Architecture Philosophy）**：歷史CLI輸出只落在owner-only受信任工具邊界，沒有L1/L2、未授權第三方、持久化外流或consumer integrity失信證據；不因此反覆輪替。若未來出現上述任一證據，再以同generation方式同步輪替所有consumer。
